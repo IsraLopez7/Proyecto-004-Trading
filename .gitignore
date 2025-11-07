@@ -205,3 +205,25 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Project-specific
+# MLflow
+mlruns/
+mlartifacts/
+
+# Data (keep structure, ignore large files)
+data/raw/*.csv
+data/processed/*.parquet
+data/processed/*.npz
+data/processed/*.pkl
+data/processed/*.png
+data/processed/*.json
+
+# Models
+models/
+*.h5
+*.keras
+*.pb
+
+# Jupyter notebooks (optional - uncomment if you want to ignore them)
+# notebooks/*.ipynb
