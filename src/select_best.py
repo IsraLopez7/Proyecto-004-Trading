@@ -1,85 +1,105 @@
 # src/select_best.py
 """
-Selecciona el mejor modelo por macro-F1 y lo promueve a Staging
+Selecciona el mejor modelo del Model Registry basado en macro-F1 en validación
+y lo promociona a "Staging".
 """
+
 import mlflow
+from mlflow.tracking import MlflowClient
 import yaml
 import logging
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def select_best_model(experiment_name, model_name, metric='macro_f1'):
+
+def load_config(config_path='config.yaml'):
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
+
+
+def get_best_run(experiment_name, metric_name='val_f1_macro'):
     """
-    Selecciona el mejor run y lo registra en Staging
+    Busca el run con mejor métrica en el experimento.
     
-    Args:
-        experiment_name: Nombre del experimento MLflow
-        model_name: Nombre del modelo en registry
-        metric: Métrica para selección
+    Returns:
+        run_id del mejor modelo
     """
-    # Configurar MLflow
-    mlflow.set_experiment(experiment_name)
+    client = MlflowClient()
     
     # Obtener experimento
-    experiment = mlflow.get_experiment_by_name(experiment_name)
+    experiment = client.get_experiment_by_name(experiment_name)
+    if experiment is None:
+        raise ValueError(f"Experimento '{experiment_name}' no encontrado")
     
-    # Buscar todos los runs
-    runs = mlflow.search_runs(
+    # Buscar runs ordenados por métrica
+    runs = client.search_runs(
         experiment_ids=[experiment.experiment_id],
-        order_by=[f"metrics.{metric} DESC"],
+        order_by=[f"metrics.{metric_name} DESC"],
         max_results=1
     )
     
     if len(runs) == 0:
-        logger.error("No se encontraron runs en el experimento")
-        return
+        raise ValueError(f"No se encontraron runs en experimento '{experiment_name}'")
     
-    # Mejor run
-    best_run = runs.iloc[0]
-    best_run_id = best_run.run_id
-    best_metric_value = best_run[f"metrics.{metric}"]
+    best_run = runs[0]
+    best_metric = best_run.data.metrics.get(metric_name)
     
     logger.info(f"Mejor run encontrado:")
-    logger.info(f"  Run ID: {best_run_id}")
-    logger.info(f"  {metric}: {best_metric_value:.4f}")
+    logger.info(f"  Run ID: {best_run.info.run_id}")
+    logger.info(f"  {metric_name}: {best_metric:.4f}")
+    logger.info(f"  Fecha: {best_run.info.start_time}")
     
-    # Obtener cliente de MLflow
-    client = mlflow.tracking.MlflowClient()
+    return best_run.info.run_id, best_metric
+
+
+def promote_to_staging(model_name, run_id):
+    """
+    Promociona versión del modelo a Staging.
+    """
+    client = MlflowClient()
     
-    # Buscar versión del modelo
-    model_versions = client.search_model_versions(
-        filter_string=f"run_id='{best_run_id}'"
+    # Buscar versión del modelo correspondiente al run_id
+    model_versions = client.search_model_versions(f"run_id='{run_id}'")
+    
+    if len(model_versions) == 0:
+        raise ValueError(f"No se encontró versión de modelo para run_id={run_id}")
+    
+    version = model_versions[0].version
+    
+    # Transicionar a Staging
+    client.transition_model_version_stage(
+        name=model_name,
+        version=version,
+        stage="Staging",
+        archive_existing_versions=True  # Archiva versiones anteriores en Staging
     )
     
-    if len(model_versions) > 0:
-        # Promover a Staging
-        version = model_versions[0].version
-        client.transition_model_version_stage(
-            name=model_name,
-            version=version,
-            stage="Staging"
-        )
-        
-        logger.info(f"Modelo promovido a Staging:")
-        logger.info(f"  Modelo: {model_name}")
-        logger.info(f"  Versión: {version}")
-        logger.info(f"  Stage: Staging")
-    else:
-        logger.error(f"No se encontró modelo registrado para run {best_run_id}")
+    logger.info(f"Modelo '{model_name}' versión {version} promocionado a Staging")
     
-    return best_run_id, best_metric_value
+    return version
+
 
 def main():
-    """Ejecutar selección de mejor modelo"""
-    with open('config.yaml', 'r') as f:
-        config = yaml.safe_load(f)
+    config = load_config()
     
-    select_best_model(
-        config['mlflow']['experiment_name'],
-        config['mlflow']['model_name'],
-        metric='macro_f1'
-    )
+    experiment_name = config['mlflow']['experiment_name']
+    model_name = config['mlflow']['model_name']
+    
+    logger.info(f"Seleccionando mejor modelo de experimento '{experiment_name}'")
+    
+    # Obtener mejor run
+    best_run_id, best_metric = get_best_run(experiment_name, metric_name='val_f1_macro')
+    
+    # Promocionar a Staging
+    version = promote_to_staging(model_name, best_run_id)
+    
+    logger.info("✅ Modelo en Staging listo para producción")
+    logger.info(f"   Model: {model_name}")
+    logger.info(f"   Version: {version}")
+    logger.info(f"   Run ID: {best_run_id}")
+    logger.info(f"   Macro-F1: {best_metric:.4f}")
+
 
 if __name__ == "__main__":
     main()

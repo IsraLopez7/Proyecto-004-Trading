@@ -1,202 +1,124 @@
 # src/drift_utils.py
 """
-Utilidades para detección de drift con KS-test
+Utilidades para detección de drift usando Kolmogorov-Smirnov test.
+Compara distribuciones de features entre train/test/val.
 """
-import pandas as pd
+
 import numpy as np
-from scipy import stats
-import pickle
+import pandas as pd
+from scipy.stats import ks_2samp
 import logging
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class DriftDetector:
-    """Detector de drift usando Kolmogorov-Smirnov test"""
+
+def load_feature_data():
+    """Carga features de train, test y val."""
+    # Cargar datos
+    df = pd.read_parquet('data/processed/features.parquet')
     
-    def __init__(self, significance_level=0.05):
-        self.significance_level = significance_level
+    # Cargar splits info
+    splits_info = pd.read_csv('data/processed/splits_info.csv', index_col=0)
+    train_size = int(splits_info.loc['train', 'size'])
+    test_size = int(splits_info.loc['test', 'size'])
+    
+    # Dividir
+    df_train = df.iloc[:train_size]
+    df_test = df.iloc[train_size:train_size+test_size]
+    df_val = df.iloc[train_size+test_size:]
+    
+    logger.info(f"Train: {len(df_train)}, Test: {len(df_test)}, Val: {len(df_val)}")
+    
+    return df_train, df_test, df_val
+
+
+def calculate_ks_drift(df_reference, df_current, feature_cols):
+    """
+    Calcula KS-test p-value para cada feature entre dos datasets.
+    
+    Args:
+        df_reference: DataFrame de referencia (ej: train)
+        df_current: DataFrame actual (ej: test o val)
+        feature_cols: lista de features a analizar
+    
+    Returns:
+        DataFrame con feature, statistic, p_value, drift_detected
+    """
+    results = []
+    
+    for feature in feature_cols:
+        ref_data = df_reference[feature].dropna().values
+        curr_data = df_current[feature].dropna().values
         
-    def ks_test(self, reference_data, current_data):
-        """
-        Aplica KS-test entre dos distribuciones
+        # KS test
+        statistic, p_value = ks_2samp(ref_data, curr_data)
         
-        Args:
-            reference_data: Datos de referencia (train)
-            current_data: Datos actuales (test/val)
-            
-        Returns:
-            statistic: KS statistic
-            p_value: p-value del test
-            drift_detected: True si p_value < significance_level
-        """
-        statistic, p_value = stats.ks_2samp(reference_data, current_data)
-        drift_detected = p_value < self.significance_level
+        # Drift detectado si p < 0.05
+        drift_detected = p_value < 0.05
         
-        return {
-            'statistic': statistic,
+        results.append({
+            'feature': feature,
+            'ks_statistic': statistic,
             'p_value': p_value,
             'drift_detected': drift_detected
-        }
+        })
     
-    def detect_feature_drift(self, df, feature_cols, train_idx, test_idx, val_idx):
-        """
-        Detecta drift para cada feature
-        
-        Args:
-            df: DataFrame completo
-            feature_cols: Lista de columnas de features
-            train_idx: Índices de train
-            test_idx: Índices de test
-            val_idx: Índices de validación
-            
-        Returns:
-            DataFrame con resultados de drift
-        """
-        results = []
-        
-        # Extraer datos por split
-        train_start, train_end = train_idx
-        test_start, test_end = test_idx
-        val_start, val_end = val_idx
-        
-        train_data = df.iloc[train_start:train_end]
-        test_data = df.iloc[test_start:test_end]
-        val_data = df.iloc[val_start:val_end]
-        
-        for feature in feature_cols:
-            # Train vs Test
-            train_test_result = self.ks_test(
-                train_data[feature].dropna(),
-                test_data[feature].dropna()
-            )
-            
-            # Train vs Val
-            train_val_result = self.ks_test(
-                train_data[feature].dropna(),
-                val_data[feature].dropna()
-            )
-            
-            results.append({
-                'feature': feature,
-                'train_test_statistic': train_test_result['statistic'],
-                'train_test_pvalue': train_test_result['p_value'],
-                'train_test_drift': train_test_result['drift_detected'],
-                'train_val_statistic': train_val_result['statistic'],
-                'train_val_pvalue': train_val_result['p_value'],
-                'train_val_drift': train_val_result['drift_detected']
-            })
-        
-        drift_df = pd.DataFrame(results)
-        
-        # Ordenar por p-value más bajo (mayor drift)
-        drift_df = drift_df.sort_values('train_test_pvalue')
-        
-        return drift_df
+    results_df = pd.DataFrame(results)
+    results_df = results_df.sort_values('p_value')
     
-    def get_top_drifted_features(self, drift_df, n=5):
-        """
-        Obtiene top N features con mayor drift
-        
-        Args:
-            drift_df: DataFrame con resultados de drift
-            n: Número de features a retornar
-            
-        Returns:
-            DataFrame con top N features
-        """
-        # Filtrar features con drift detectado
-        drifted = drift_df[
-            (drift_df['train_test_drift']) | 
-            (drift_df['train_val_drift'])
-        ]
-        
-        return drifted.head(n)
-    
-    def interpret_drift(self, drift_df):
-        """
-        Genera interpretación del drift detectado
-        
-        Args:
-            drift_df: DataFrame con resultados de drift
-            
-        Returns:
-            String con interpretación
-        """
-        n_features = len(drift_df)
-        n_drift_test = drift_df['train_test_drift'].sum()
-        n_drift_val = drift_df['train_val_drift'].sum()
-        
-        interpretation = f"""
-        === Análisis de Data Drift ===
-        
-        Total de features analizados: {n_features}
-        
-        Drift detectado (Train vs Test): {n_drift_test} features ({n_drift_test/n_features*100:.1f}%)
-        Drift detectado (Train vs Val): {n_drift_val} features ({n_drift_val/n_features*100:.1f}%)
-        
-        Interpretación:
-        """
-        
-        if n_drift_test > n_features * 0.3:
-            interpretation += """
-        ⚠️ ALTO DRIFT: Más del 30% de features muestran drift significativo.
-        El modelo podría no generalizar bien a datos nuevos.
-        Considerar re-entrenar con datos más recientes.
-        """
-        elif n_drift_test > n_features * 0.1:
-            interpretation += """
-        ⚡ DRIFT MODERADO: Entre 10-30% de features muestran drift.
-        Monitorear performance del modelo de cerca.
-        """
-        else:
-            interpretation += """
-        ✅ DRIFT BAJO: Menos del 10% de features muestran drift.
-        El modelo debería mantener su performance.
-        """
-        
-        return interpretation
-    
-    def run_drift_analysis(self):
-        """Pipeline completo de análisis de drift"""
-        # Cargar datos
-        df = pd.read_parquet('data/processed/features.parquet')
-        
-        # Cargar metadata
-        with open('data/processed/feature_columns.pkl', 'rb') as f:
-            feature_cols = pickle.load(f)
-        
-        with open('data/processed/splits.pkl', 'rb') as f:
-            splits = pickle.load(f)
-        
-        logger.info("Detectando drift en features...")
-        
-        # Detectar drift
-        drift_results = self.detect_feature_drift(
-            df,
-            feature_cols,
-            splits['train_idx'],
-            splits['test_idx'],
-            splits['val_idx']
-        )
-        
-        # Top features con drift
-        top_drift = self.get_top_drifted_features(drift_results)
-        
-        # Interpretación
-        interpretation = self.interpret_drift(drift_results)
-        
-        # Guardar resultados
-        drift_results.to_csv('data/processed/drift_analysis.csv', index=False)
-        
-        logger.info(interpretation)
-        
-        return drift_results, top_drift, interpretation
+    return results_df
 
-def main():
-    """Ejecutar análisis de drift"""
-    detector = DriftDetector()
-    detector.run_drift_analysis()
+
+def get_top_drift_features(drift_df, top_n=5):
+    """Obtiene top N features con mayor drift (menor p-value)."""
+    top_drift = drift_df.nsmallest(top_n, 'p_value')
+    return top_drift
+
+
+def interpret_drift(drift_df):
+    """Genera interpretación básica del drift."""
+    n_drift = (drift_df['drift_detected'] == True).sum()
+    pct_drift = (n_drift / len(drift_df)) * 100
+    
+    interpretation = f"""
+    📊 ANÁLISIS DE DRIFT
+    
+    Total de features analizados: {len(drift_df)}
+    Features con drift detectado (p < 0.05): {n_drift} ({pct_drift:.1f}%)
+    
+    Interpretación:
+    - Si >30% de features tienen drift → Alta probabilidad de degradación del modelo
+    - Si 10-30% tienen drift → Drift moderado, monitorear de cerca
+    - Si <10% tienen drift → Drift bajo, modelo estable
+    
+    Top 5 features con mayor drift:
+    """
+    
+    top_5 = drift_df.nsmallest(5, 'p_value')
+    for _, row in top_5.iterrows():
+        interpretation += f"\n  • {row['feature']}: p-value={row['p_value']:.6f}"
+    
+    return interpretation
+
 
 if __name__ == "__main__":
-    main()
+    # Test de funcionalidades
+    df_train, df_test, df_val = load_feature_data()
+    
+    # Features a analizar (excluir OHLCV y label)
+    exclude_cols = ['Open', 'High', 'Low', 'Close', 'Volume', 'label']
+    feature_cols = [col for col in df_train.columns if col not in exclude_cols]
+    
+    # Drift train vs test
+    logger.info("Calculando drift: train vs test")
+    drift_test = calculate_ks_drift(df_train, df_test, feature_cols)
+    
+    # Drift train vs val
+    logger.info("Calculando drift: train vs val")
+    drift_val = calculate_ks_drift(df_train, df_val, feature_cols)
+    
+    # Interpretación
+    print(interpret_drift(drift_test))
+    
+    logger.info("✅ drift_utils.py test completado")

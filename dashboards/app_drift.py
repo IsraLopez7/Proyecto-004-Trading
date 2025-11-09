@@ -1,183 +1,137 @@
 # dashboards/app_drift.py
 """
-Dashboard Streamlit para monitoreo de drift
+Dashboard Streamlit para visualización de drift.
+Muestra KS-test p-values y Top-5 features con mayor drift.
 """
+
 import streamlit as st
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-import pickle
-from pathlib import Path
+import numpy as np
+import sys
+sys.path.append('..')
 
-st.set_page_config(
-    page_title="Data Drift Monitor",
-    page_icon="📊",
-    layout="wide"
+from src.drift_utils import (
+    load_feature_data,
+    calculate_ks_drift,
+    get_top_drift_features,
+    interpret_drift
 )
 
-st.title("🔍 Monitor de Data Drift")
-st.markdown("---")
+st.set_page_config(page_title="Data Drift Monitor", layout="wide")
 
-# Cargar datos de drift
-@st.cache_data
-def load_drift_data():
-    """Carga resultados de análisis de drift"""
-    if Path('data/processed/drift_analysis.csv').exists():
-        return pd.read_csv('data/processed/drift_analysis.csv')
-    else:
-        return None
+st.title("📊 Data Drift Monitoring Dashboard")
+st.markdown("Monitoreo de drift usando Kolmogorov-Smirnov test")
 
 # Cargar datos
-drift_df = load_drift_data()
+with st.spinner("Cargando datos..."):
+    df_train, df_test, df_val = load_feature_data()
 
-if drift_df is None:
-    st.error("❌ No se encontraron datos de drift. Ejecuta primero: `python src/drift_utils.py`")
-else:
-    # Métricas principales
-    col1, col2, col3, col4 = st.columns(4)
+# Features a analizar
+exclude_cols = ['Open', 'High', 'Low', 'Close', 'Volume', 'label']
+feature_cols = [col for col in df_train.columns if col not in exclude_cols]
+
+st.success(f"✅ Datos cargados: {len(feature_cols)} features analizados")
+
+# Tabs
+tab1, tab2, tab3 = st.tabs(["📈 Train vs Test", "📉 Train vs Val", "🔍 Interpretación"])
+
+with tab1:
+    st.header("Drift: Train vs Test")
     
-    total_features = len(drift_df)
-    drift_test = drift_df['train_test_drift'].sum()
-    drift_val = drift_df['train_val_drift'].sum()
-    avg_pvalue = drift_df['train_test_pvalue'].mean()
+    drift_test = calculate_ks_drift(df_train, df_test, feature_cols)
     
+    # Métricas
+    col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("Total Features", total_features)
-    
+        n_drift = (drift_test['drift_detected'] == True).sum()
+        st.metric("Features con drift", n_drift)
     with col2:
-        st.metric(
-            "Drift Train→Test",
-            f"{drift_test}",
-            f"{drift_test/total_features*100:.1f}%"
-        )
-    
+        pct_drift = (n_drift / len(drift_test)) * 100
+        st.metric("% de drift", f"{pct_drift:.1f}%")
     with col3:
-        st.metric(
-            "Drift Train→Val",
-            f"{drift_val}",
-            f"{drift_val/total_features*100:.1f}%"
-        )
+        min_pvalue = drift_test['p_value'].min()
+        st.metric("p-value mínimo", f"{min_pvalue:.6f}")
     
-    with col4:
-        st.metric("Avg P-Value", f"{avg_pvalue:.4f}")
+    # Tabla completa
+    st.subheader("Resultados completos")
+    st.dataframe(drift_test, use_container_width=True)
+    
+    # Top 5
+    st.subheader("Top 5 features con mayor drift")
+    top_5 = get_top_drift_features(drift_test, top_n=5)
+    
+    for _, row in top_5.iterrows():
+        with st.expander(f"🔴 {row['feature']} (p-value: {row['p_value']:.6f})"):
+            st.write(f"**KS Statistic:** {row['ks_statistic']:.4f}")
+            st.write(f"**Drift detectado:** {'Sí' if row['drift_detected'] else 'No'}")
+            
+            # Mini histograma comparativo
+            import matplotlib.pyplot as plt
+            fig, ax = plt.subplots(figsize=(8, 3))
+            
+            ax.hist(df_train[row['feature']].dropna(), bins=30, alpha=0.5, label='Train', density=True)
+            ax.hist(df_test[row['feature']].dropna(), bins=30, alpha=0.5, label='Test', density=True)
+            ax.legend()
+            ax.set_xlabel(row['feature'])
+            ax.set_ylabel('Densidad')
+            ax.set_title(f"Distribución: {row['feature']}")
+            
+            st.pyplot(fig)
+
+with tab2:
+    st.header("Drift: Train vs Validation")
+    
+    drift_val = calculate_ks_drift(df_train, df_val, feature_cols)
+    
+    # Métricas
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        n_drift_val = (drift_val['drift_detected'] == True).sum()
+        st.metric("Features con drift", n_drift_val)
+    with col2:
+        pct_drift_val = (n_drift_val / len(drift_val)) * 100
+        st.metric("% de drift", f"{pct_drift_val:.1f}%")
+    with col3:
+        min_pvalue_val = drift_val['p_value'].min()
+        st.metric("p-value mínimo", f"{min_pvalue_val:.6f}")
+    
+    # Tabla
+    st.subheader("Resultados completos")
+    st.dataframe(drift_val, use_container_width=True)
+    
+    # Top 5
+    st.subheader("Top 5 features con mayor drift")
+    top_5_val = get_top_drift_features(drift_val, top_n=5)
+    
+    for _, row in top_5_val.iterrows():
+        with st.expander(f"🔴 {row['feature']} (p-value: {row['p_value']:.6f})"):
+            st.write(f"**KS Statistic:** {row['ks_statistic']:.4f}")
+            st.write(f"**Drift detectado:** {'Sí' if row['drift_detected'] else 'No'}")
+
+with tab3:
+    st.header("🧠 Interpretación del Drift")
+    
+    st.markdown("### Train vs Test")
+    interpretation_test = interpret_drift(drift_test)
+    st.text(interpretation_test)
     
     st.markdown("---")
     
-    # Tabs
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "📊 Tabla de Drift",
-        "🔝 Top-5 Features",
-        "📈 Visualización",
-        "💡 Interpretación"
-    ])
+    st.markdown("### Train vs Validation")
+    interpretation_val = interpret_drift(drift_val)
+    st.text(interpretation_val)
     
-    with tab1:
-        st.subheader("Tabla Completa de Drift por Feature")
-        
-        # Filtros
-        col1, col2 = st.columns(2)
-        with col1:
-            show_drift_only = st.checkbox("Mostrar solo features con drift", value=False)
-        
-        with col2:
-            p_value_threshold = st.slider(
-                "Umbral p-value",
-                min_value=0.01,
-                max_value=0.10,
-                value=0.05,
-                step=0.01
-            )
-        
-        # Filtrar datos
-        display_df = drift_df.copy()
-        if show_drift_only:
-            display_df = display_df[
-                (display_df['train_test_drift']) |
-                (display_df['train_val_drift'])
-            ]
-        
-        # Formatear tabla
-        display_df['train_test_pvalue'] = display_df['train_test_pvalue'].apply(lambda x: f"{x:.6f}")
-        display_df['train_val_pvalue'] = display_df['train_val_pvalue'].apply(lambda x: f"{x:.6f}")
-        display_df['train_test_statistic'] = display_df['train_test_statistic'].apply(lambda x: f"{x:.4f}")
-        display_df['train_val_statistic'] = display_df['train_val_statistic'].apply(lambda x: f"{x:.4f}")
-        
-        # Renombrar columnas para display
-        display_df = display_df.rename(columns={
-            'feature': 'Feature',
-            'train_test_statistic': 'KS Stat (Test)',
-            'train_test_pvalue': 'P-Value (Test)',
-            'train_test_drift': 'Drift Test?',
-            'train_val_statistic': 'KS Stat (Val)',
-            'train_val_pvalue': 'P-Value (Val)',
-            'train_val_drift': 'Drift Val?'
-        })
-        
-        st.dataframe(
-            display_df,
-            use_container_width=True,
-            hide_index=True
-        )
+    st.markdown("---")
     
-    with tab2:
-        st.subheader("🚨 Top-5 Features con Mayor Drift")
-        
-        # Obtener top 5 con menor p-value
-        top5 = drift_df.nsmallest(5, 'train_test_pvalue')
-        
-        for idx, row in top5.iterrows():
-            with st.expander(f"📊 {row['feature']}", expanded=True):
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    st.metric(
-                        "KS Statistic",
-                        f"{row['train_test_statistic']:.4f}"
-                    )
-                
-                with col2:
-                    st.metric(
-                        "P-Value",
-                        f"{row['train_test_pvalue']:.6f}"
-                    )
-                
-                with col3:
-                    drift_status = "🔴 DRIFT" if row['train_test_drift'] else "🟢 OK"
-                    st.metric("Status", drift_status)
-                
-                # Interpretación
-                if row['train_test_drift']:
-                    st.warning(
-                        f"⚠️ La distribución de **{row['feature']}** ha cambiado "
-                        f"significativamente entre train y test (p-value < 0.05)"
-                    )
+    st.info("""
+    **¿Qué hacer si hay drift alto?**
     
-    with tab3:
-        st.subheader("Visualización de Drift")
-        
-        # Gráfico de barras con p-values
-        fig1 = px.bar(
-            drift_df.head(20),
-            x='feature',
-            y='train_test_pvalue',
-            title='P-Values por Feature (Train vs Test)',
-            labels={'train_test_pvalue': 'P-Value', 'feature': 'Feature'},
-            color='train_test_drift',
-            color_discrete_map={True: 'red', False: 'green'}
-        )
-        
-        # Agregar línea de umbral
-        fig1.add_hline(
-            y=0.05,
-            line_dash="dash",
-            line_color="red",
-            annotation_text="Umbral (p=0.05)"
-        )
-        
-        fig1.update_xaxes(tickangle=45)
-        st.plotly_chart(fig1, use_container_width=True)
-        
-        # Scatter plot: KS Statistic vs P-Value
-        fig2 = px.scatter(
-            drift_df,
-            x='train_test_
+    1. **Reentrenar el modelo** con datos más recientes
+    2. **Revisar features** que cambiaron más
+    3. **Ajustar ventanas** de features (ej: SMA más cortas)
+    4. **Feature selection** para remover features inestables
+    5. **Monitoreo continuo** del performance en producción
+    """)
+
+st.markdown("---")
+st.caption("Dashboard creado con Streamlit | Deep Learning Trading MLOps")

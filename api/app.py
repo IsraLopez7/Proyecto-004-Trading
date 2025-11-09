@@ -1,176 +1,150 @@
 # api/app.py
 """
-API FastAPI para predicción de señales
+API FastAPI para inferencia en tiempo real.
+Endpoints:
+  - GET /health: health check
+  - POST /predict: predicción de señal usando últimas n_bars
 """
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import Dict, List, Optional
-import mlflow
 import numpy as np
 import pandas as pd
+import mlflow
+import mlflow.keras
 import pickle
 import yaml
 import logging
-from datetime import datetime
+from typing import List, Dict
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Crear app
-app = FastAPI(
-    title="CNN Trading Signal API",
-    description="API para predicción de señales de trading usando CNN",
-    version="1.0.0"
-)
+app = FastAPI(title="CNN Trading Signal API", version="1.0")
 
-# Modelos de datos
-class PredictionRequest(BaseModel):
-    n_bars: int = 1
-    
-class PredictionResponse(BaseModel):
-    signal: str
-    probabilities: Dict[str, float]
-    confidence: float
-    metadata: Dict[str, any]
-    timestamp: str
-
-# Variables globales
+# Variables globales para modelo y scaler
 MODEL = None
+SCALER = None
 CONFIG = None
-METADATA = None
+
+
+def load_config(config_path='../config.yaml'):
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
+
+
+def load_model_and_scaler():
+    """Carga modelo desde Model Registry y scaler."""
+    global MODEL, SCALER, CONFIG
+    
+    CONFIG = load_config()
+    
+    # Cargar modelo desde Staging
+    model_name = CONFIG['mlflow']['model_name']
+    model_uri = f"models:/{model_name}/Staging"
+    
+    logger.info(f"Cargando modelo desde {model_uri}")
+    MODEL = mlflow.keras.load_model(model_uri)
+    logger.info("Modelo cargado exitosamente")
+    
+    # Cargar scaler
+    with open('../data/processed/scaler.pkl', 'rb') as f:
+        SCALER = pickle.load(f)
+    logger.info("Scaler cargado exitosamente")
+
 
 @app.on_event("startup")
 async def startup_event():
-    """Carga modelo y configuración al iniciar"""
-    global MODEL, CONFIG, METADATA
-    
-    # Cargar configuración
-    with open('config.yaml', 'r') as f:
-        CONFIG = yaml.safe_load(f)
-    
-    # Cargar modelo desde MLflow
-    try:
-        client = mlflow.tracking.MlflowClient()
-        model_name = CONFIG['mlflow']['model_name']
-        
-        # Obtener última versión en Staging
-        model_version = client.get_latest_versions(
-            model_name,
-            stages=["Staging"]
-        )[0]
-        
-        # Cargar modelo
-        model_uri = f"models:/{model_name}/{model_version.version}"
-        MODEL = mlflow.keras.load_model(model_uri)
-        
-        logger.info(f"Modelo cargado: {model_name} v{model_version.version}")
-        
-        # Cargar metadata
-        with open('data/processed/window_metadata.pkl', 'rb') as f:
-            METADATA = pickle.load(f)
-            
-    except Exception as e:
-        logger.error(f"Error cargando modelo: {e}")
-        raise
+    """Carga modelo al iniciar la API."""
+    load_model_and_scaler()
 
-@app.get("/")
-async def root():
-    """Endpoint raíz"""
-    return {
-        "message": "CNN Trading Signal API",
-        "status": "running",
-        "model_loaded": MODEL is not None
-    }
 
 @app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "ok",
-        "timestamp": datetime.now().isoformat()
-    }
+def health_check():
+    """Health check endpoint."""
+    return {"status": "ok", "model_loaded": MODEL is not None}
 
-@app.post("/predict", response_model=PredictionResponse)
-async def predict(request: PredictionRequest):
+
+class PredictionRequest(BaseModel):
+    """Request body para predicción."""
+    n_bars: int = 256  # Número de barras (igual a W)
+
+
+@app.post("/predict")
+def predict(request: PredictionRequest):
     """
-    Genera predicción de señal de trading
+    Realiza predicción de señal de trading.
     
-    Args:
-        request: PredictionRequest con n_bars
-        
+    Usa las últimas n_bars de features.parquet.
+    
     Returns:
-        PredictionResponse con señal y probabilidades
+        signal: 0 (long), 1 (hold), 2 (short)
+        probabilities: dict con prob de cada clase
+        metadata: info del modelo
     """
-    if MODEL is None:
-        raise HTTPException(status_code=503, detail="Modelo no disponible")
+    if MODEL is None or SCALER is None:
+        raise HTTPException(status_code=503, detail="Modelo no cargado")
     
     try:
-        # Cargar datos más recientes
-        df = pd.read_parquet('data/processed/features.parquet')
+        # Cargar últimas n_bars de features
+        df = pd.read_parquet('../data/processed/features.parquet')
         
-        # Preparar ventana
-        feature_cols = METADATA['feature_columns']
-        window_size = METADATA['window_size']
-        
-        # Tomar última ventana disponible
-        if len(df) < window_size:
+        n_bars = request.n_bars
+        if len(df) < n_bars:
             raise HTTPException(
-                status_code=400,
-                detail=f"Datos insuficientes. Se requieren {window_size} barras"
+                status_code=400, 
+                detail=f"No hay suficientes datos. Disponibles: {len(df)}, requeridos: {n_bars}"
             )
         
-        # Crear ventana
-        window = df.iloc[-window_size:][feature_cols].values
-        X = np.array([window])
+        # Últimas n_bars
+        df_recent = df.tail(n_bars)
+        
+        # Extraer features (excluir OHLCV y label)
+        exclude_cols = ['Open', 'High', 'Low', 'Close', 'Volume', 'label']
+        feature_cols = [col for col in df_recent.columns if col not in exclude_cols]
+        
+        X = df_recent[feature_cols].values
+        
+        # Normalizar con scaler pre-entrenado
+        X_norm = SCALER.transform(X)
+        
+        # Reshape para CNN: (1, n_bars, n_features)
+        X_input = X_norm.reshape(1, n_bars, -1)
         
         # Predicción
-        probs = MODEL.predict(X)[0]
-        signal_idx = np.argmax(probs)
+        probs = MODEL.predict(X_input, verbose=0)[0]
+        signal = int(np.argmax(probs))
         
-        # Mapear a nombres
-        signal_map = {0: 'hold', 1: 'long', 2: 'short'}
-        signal = signal_map[signal_idx]
+        # Mapeo de señales
+        signal_names = {0: 'long', 1: 'hold', 2: 'short'}
         
-        # Crear respuesta
-        response = PredictionResponse(
-            signal=signal,
-            probabilities={
-                'hold': float(probs[0]),
-                'long': float(probs[1]),
-                'short': float(probs[2])
+        # Response
+        response = {
+            "signal": signal,
+            "signal_name": signal_names[signal],
+            "probabilities": {
+                "long": float(probs[0]),
+                "hold": float(probs[1]),
+                "short": float(probs[2])
             },
-            confidence=float(np.max(probs)),
-            metadata={
-                'model_name': CONFIG['mlflow']['model_name'],
-                'window_size': window_size,
-                'n_features': len(feature_cols),
-                'last_date': df.iloc[-1]['date'].strftime('%Y-%m-%d')
-            },
-            timestamp=datetime.now().isoformat()
-        )
+            "metadata": {
+                "model_name": CONFIG['mlflow']['model_name'],
+                "n_bars_used": n_bars,
+                "last_date": str(df_recent.index[-1]),
+                "n_features": len(feature_cols)
+            }
+        }
+        
+        logger.info(f"Predicción: {signal_names[signal]} (probs: {probs})")
         
         return response
-        
+    
     except Exception as e:
         logger.error(f"Error en predicción: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/model/info")
-async def model_info():
-    """Información del modelo actual"""
-    if MODEL is None:
-        raise HTTPException(status_code=503, detail="Modelo no disponible")
-    
-    return {
-        "model_name": CONFIG['mlflow']['model_name'],
-        "window_size": CONFIG['window_size'],
-        "horizon": CONFIG['horizon'],
-        "threshold": CONFIG['threshold'],
-        "n_features": METADATA['n_features'],
-        "feature_columns": METADATA['feature_columns'][:10],  # Primeros 10
-        "model_config": CONFIG['model']
-    }
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    config = load_config()
+    uvicorn.run(app, host=config['api']['host'], port=config['api']['port'])

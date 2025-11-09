@@ -1,127 +1,95 @@
 # src/infer.py
 """
-Inferencia offline para generar señales de trading
+Inferencia offline: genera señales de trading desde el modelo en Staging.
+Útil para backtest sin usar API.
 """
+
 import numpy as np
 import pandas as pd
-import mlflow
 import yaml
-import pickle
 import logging
+import mlflow
+import pickle
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class SignalGenerator:
-    """Generador de señales usando modelo en Staging"""
-    
-    def __init__(self, config):
-        self.config = config
-        self.model = None
-        self.load_model()
-        
-    def load_model(self):
-        """Carga modelo desde MLflow Registry (Staging)"""
-        client = mlflow.tracking.MlflowClient()
-        
-        # Obtener modelo en Staging
-        model_name = self.config['mlflow']['model_name']
-        model_version = client.get_latest_versions(
-            model_name,
-            stages=["Staging"]
-        )[0]
-        
-        # Cargar modelo
-        model_uri = f"models:/{model_name}/{model_version.version}"
-        self.model = mlflow.keras.load_model(model_uri)
-        
-        logger.info(f"Modelo cargado: {model_name} v{model_version.version}")
-        
-    def generate_signals(self, X):
-        """
-        Genera señales de trading
-        
-        Args:
-            X: Array de features (n_samples, window_size, n_features)
-            
-        Returns:
-            DataFrame con señales y probabilidades
-        """
-        # Predicciones
-        probs = self.model.predict(X)
-        signals = probs.argmax(axis=1)
-        
-        # Mapear a nombres
-        signal_names = {0: 'hold', 1: 'long', 2: 'short'}
-        
-        # Crear DataFrame
-        results = pd.DataFrame({
-            'signal': [signal_names[s] for s in signals],
-            'signal_num': signals,
-            'prob_hold': probs[:, 0],
-            'prob_long': probs[:, 1],
-            'prob_short': probs[:, 2],
-            'confidence': probs.max(axis=1)
-        })
-        
-        return results
-    
-    def infer_latest(self, n_bars=1):
-        """
-        Infiere señal para las últimas n_bars
-        
-        Args:
-            n_bars: Número de barras a predecir
-            
-        Returns:
-            DataFrame con señales
-        """
-        # Cargar datos
-        df = pd.read_parquet('data/processed/labeled_features.parquet')
-        
-        # Cargar metadata
-        with open('data/processed/window_metadata.pkl', 'rb') as f:
-            metadata = pickle.load(f)
-        
-        feature_cols = metadata['feature_columns']
-        window_size = metadata['window_size']
-        
-        # Preparar ventanas para las últimas n_bars
-        X_list = []
-        for i in range(n_bars):
-            start_idx = len(df) - window_size - i
-            end_idx = len(df) - i
-            window = df.iloc[start_idx:end_idx][feature_cols].values
-            X_list.append(window)
-        
-        X = np.array(X_list)
-        
-        # Generar señales
-        signals = self.generate_signals(X)
-        
-        # Agregar fechas
-        signals['date'] = df.iloc[-n_bars:]['date'].values
-        
-        return signals
 
-def main():
-    """Generar señales para backtest"""
-    with open('config.yaml', 'r') as f:
-        config = yaml.safe_load(f)
+def load_config(config_path='config.yaml'):
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
+
+
+def load_model_from_registry(model_name, stage='Staging'):
+    """Carga modelo desde Model Registry."""
+    model_uri = f"models:/{model_name}/{stage}"
+    logger.info(f"Cargando modelo desde {model_uri}")
+    model = mlflow.keras.load_model(model_uri)
+    return model
+
+
+def generate_signals(model, X, W):
+    """
+    Genera señales {0:long, 1:hold, 2:short} para todo el conjunto X.
     
-    generator = SignalGenerator(config)
+    Returns:
+        signals: array de señales
+        probabilities: array de probabilidades (n_samples, 3)
+    """
+    # Crear ventanas
+    X_windows = []
+    for i in range(len(X) - W + 1):
+        X_windows.append(X[i:i+W])
     
-    # Cargar datos de test
-    X_test = np.load('data/processed/X_test.npy')
+    X_windows = np.array(X_windows)
     
-    # Generar señales
-    signals = generator.generate_signals(X_test)
-    
-    # Guardar señales
-    signals.to_csv('data/processed/test_signals.csv', index=False)
+    # Predicción
+    probs = model.predict(X_windows, verbose=0)
+    signals = np.argmax(probs, axis=1)
     
     logger.info(f"Señales generadas: {len(signals)}")
-    logger.info(f"Distribución: \n{signals['signal'].value_counts()}")
+    
+    return signals, probs
+
+
+def main():
+    config = load_config()
+    
+    # Cargar modelo
+    model_name = config['mlflow']['model_name']
+    model = load_model_from_registry(model_name, stage='Staging')
+    
+    # Cargar datos de validación (para ejemplo)
+    X_val = np.load('data/processed/X_val.npy')
+    y_val = np.load('data/processed/y_val.npy')
+    
+    W = config['windows']['W']
+    
+    # Generar señales (ya viene en ventanas, así que simplemente predecimos)
+    probs = model.predict(X_val, verbose=0)
+    signals = np.argmax(probs, axis=1)
+    
+    # Guardar señales
+    signals_df = pd.DataFrame({
+        'signal': signals,
+        'prob_long': probs[:, 0],
+        'prob_hold': probs[:, 1],
+        'prob_short': probs[:, 2],
+        'true_label': y_val
+    })
+    
+    signals_df.to_csv('results/signals_val.csv', index=False)
+    logger.info("Señales guardadas en results/signals_val.csv")
+    
+    # Estadísticas
+    label_names = {0: 'long', 1: 'hold', 2: 'short'}
+    for i in range(3):
+        count = (signals == i).sum()
+        pct = (count / len(signals)) * 100
+        logger.info(f"{label_names[i]}: {count} ({pct:.2f}%)")
+    
+    logger.info("✅ infer.py completado")
+
 
 if __name__ == "__main__":
     main()

@@ -1,165 +1,118 @@
 # src/data_loader.py
 """
-Carga y limpieza de datos de QQQ con splits cronológicos
+Carga datos crudos de QQQ, limpia valores faltantes, 
+y genera splits cronológicos (60/20/20) sin look-ahead.
 """
+
 import pandas as pd
 import numpy as np
-import yfinance as yf
 import yaml
 import logging
 from pathlib import Path
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def load_config():
-    """Carga configuración desde config.yaml"""
-    with open('config.yaml', 'r') as f:
+
+def load_config(config_path='config.yaml'):
+    """Carga archivo de configuración YAML."""
+    with open(config_path, 'r') as f:
         return yaml.safe_load(f)
 
-def download_data(symbol, start_date, end_date):
+
+def load_raw_data(csv_path):
     """
-    Descarga datos OHLCV de Yahoo Finance
-    
-    Args:
-        symbol: Ticker del activo
-        start_date: Fecha inicial
-        end_date: Fecha final
-    
-    Returns:
-        DataFrame con OHLCV
+    Carga CSV con columnas: Date, Open, High, Low, Close, Volume.
+    Retorna DataFrame indexado por fecha.
     """
-    logger.info(f"Descargando datos de {symbol} desde {start_date} hasta {end_date}")
-    
-    # Descargar datos
-    data = yf.download(symbol, start=start_date, end=end_date, progress=False)
-    
-    # Renombrar columnas para consistencia
-    data = data.rename(columns={
-        'Open': 'open',
-        'High': 'high',
-        'Low': 'low',
-        'Close': 'close',
-        'Volume': 'volume',
-        'Adj Close': 'adj_close'
-    })
-    
-    # Reset index para tener Date como columna
-    data = data.reset_index()
-    data = data.rename(columns={'Date': 'date'})
-    
-    return data
+    logger.info(f"Cargando datos desde {csv_path}")
+    df = pd.read_csv(csv_path, parse_dates=['Date'], index_col='Date')
+    df = df.sort_index()  # Asegurar orden cronológico
+    logger.info(f"Datos cargados: {len(df)} filas desde {df.index[0]} hasta {df.index[-1]}")
+    return df
+
 
 def clean_data(df):
     """
-    Limpieza de datos: manejo de faltantes y valores anómalos
-    
-    Args:
-        df: DataFrame crudo
-    
-    Returns:
-        DataFrame limpio
+    Manejo de valores faltantes con forward-fill.
+    Remueve filas con NaN al inicio si existen.
     """
-    logger.info(f"Limpiando datos. Shape inicial: {df.shape}")
+    logger.info(f"Valores faltantes antes de limpieza: {df.isnull().sum().sum()}")
     
-    # Eliminar filas con valores nulos
-    df = df.dropna()
-    
-    # Forward fill para cualquier gap menor
+    # Forward fill para valores faltantes
     df = df.fillna(method='ffill')
     
-    # Verificar datos anómalos (volumen = 0)
-    df = df[df['volume'] > 0]
+    # Eliminar filas con NaN restantes (inicio del dataset)
+    df = df.dropna()
     
-    # Ordenar por fecha
-    df = df.sort_values('date')
-    
-    logger.info(f"Shape final después de limpieza: {df.shape}")
-    logger.info(f"Rango de fechas: {df['date'].min()} a {df['date'].max()}")
-    logger.info(f"Total de días de trading: {len(df)}")
+    logger.info(f"Valores faltantes después de limpieza: {df.isnull().sum().sum()}")
+    logger.info(f"Filas finales: {len(df)}")
     
     return df
 
-def create_splits(df, train_pct=0.6, test_pct=0.2):
+
+def create_splits(df, train_pct=0.60, test_pct=0.20, val_pct=0.20):
     """
-    Crea splits cronológicos sin look-ahead bias
-    
-    Args:
-        df: DataFrame completo
-        train_pct: Porcentaje para entrenamiento
-        test_pct: Porcentaje para test
-    
-    Returns:
-        Diccionario con splits e índices
+    Divide datos cronológicamente: 60% train, 20% test, 20% val.
+    Retorna índices de corte.
     """
-    n_samples = len(df)
+    n = len(df)
+    train_end = int(n * train_pct)
+    test_end = train_end + int(n * test_pct)
     
-    # Calcular índices de corte
-    train_end = int(n_samples * train_pct)
-    test_end = int(n_samples * (train_pct + test_pct))
+    train_idx = df.index[:train_end]
+    test_idx = df.index[train_end:test_end]
+    val_idx = df.index[test_end:]
     
-    # Crear splits
-    train_data = df.iloc[:train_end].copy()
-    test_data = df.iloc[train_end:test_end].copy()
-    val_data = df.iloc[test_end:].copy()
+    logger.info(f"Train: {len(train_idx)} filas ({train_idx[0]} a {train_idx[-1]})")
+    logger.info(f"Test:  {len(test_idx)} filas ({test_idx[0]} a {test_idx[-1]})")
+    logger.info(f"Val:   {len(val_idx)} filas ({val_idx[0]} a {val_idx[-1]})")
     
-    logger.info(f"Splits creados:")
-    logger.info(f"  Train: {len(train_data)} samples ({train_data['date'].min()} a {train_data['date'].max()})")
-    logger.info(f"  Test:  {len(test_data)} samples ({test_data['date'].min()} a {test_data['date'].max()})")
-    logger.info(f"  Val:   {len(val_data)} samples ({val_data['date'].min()} a {val_data['date'].max()})")
-    
-    return {
-        'train': train_data,
-        'test': test_data,
-        'val': val_data,
-        'train_idx': (0, train_end),
-        'test_idx': (train_end, test_end),
-        'val_idx': (test_end, n_samples)
+    # Guardar splits en archivo para referencia
+    splits_info = {
+        'train': {'start': str(train_idx[0]), 'end': str(train_idx[-1]), 'size': len(train_idx)},
+        'test': {'start': str(test_idx[0]), 'end': str(test_idx[-1]), 'size': len(test_idx)},
+        'val': {'start': str(val_idx[0]), 'end': str(val_idx[-1]), 'size': len(val_idx)}
     }
+    
+    splits_df = pd.DataFrame(splits_info).T
+    splits_df.to_csv('data/processed/splits_info.csv')
+    logger.info("Información de splits guardada en data/processed/splits_info.csv")
+    
+    return train_idx, test_idx, val_idx
+
 
 def main():
-    """Pipeline principal de carga de datos"""
-    # Cargar configuración
+    """Flujo principal de carga y limpieza de datos."""
     config = load_config()
     
-    # Crear directorios
-    Path('data/raw').mkdir(parents=True, exist_ok=True)
-    Path('data/processed').mkdir(parents=True, exist_ok=True)
+    # Cargar datos crudos
+    raw_path = config['data']['raw_path']
+    df = load_raw_data(raw_path)
     
-    # Descargar datos
-    df = download_data(
-        config['asset'],
-        config['data_start'],
-        config['data_end']
-    )
-    
-    # Limpiar datos
+    # Limpieza
     df = clean_data(df)
     
-    # Guardar datos crudos
-    raw_path = f"data/raw/{config['asset']}.csv"
-    df.to_csv(raw_path, index=False)
-    logger.info(f"Datos guardados en {raw_path}")
+    # Verificar que tenemos columnas OHLCV
+    required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        raise ValueError(f"Columnas faltantes en el CSV: {missing_cols}")
     
-    # Crear y guardar splits
-    splits = create_splits(
-        df,
-        config['train_split'],
-        config['test_split']
-    )
+    # Crear splits cronológicos
+    train_pct = config['splits']['train']
+    test_pct = config['splits']['test']
+    val_pct = config['splits']['val']
     
-    # Guardar información de splits
-    splits_info = {
-        'train_idx': splits['train_idx'],
-        'test_idx': splits['test_idx'],
-        'val_idx': splits['val_idx']
-    }
+    create_splits(df, train_pct, test_pct, val_pct)
     
-    import pickle
-    with open('data/processed/splits.pkl', 'wb') as f:
-        pickle.dump(splits_info, f)
+    # Guardar datos limpios (para siguiente paso)
+    output_path = 'data/processed/clean_data.parquet'
+    df.to_parquet(output_path)
+    logger.info(f"Datos limpios guardados en {output_path}")
     
-    logger.info("Pipeline de datos completado exitosamente")
+    logger.info("✅ data_loader.py completado exitosamente")
+
 
 if __name__ == "__main__":
     main()

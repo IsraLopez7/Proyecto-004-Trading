@@ -1,141 +1,113 @@
 # src/labeling.py
 """
-Creación de etiquetas multiclase: long, short, hold
+Genera etiquetas multiclase {long:0, hold:1, short:2} basadas en:
+- Horizonte H (días hacia adelante)
+- Umbral τ (threshold para decidir si es señal clara)
+
+Reglas:
+  return_{t→t+H} > +τ  ⇒ long (0)
+  return_{t→t+H} < −τ  ⇒ short (2)
+  otro caso            ⇒ hold (1)
 """
+
 import pandas as pd
 import numpy as np
 import yaml
-import pickle
 import logging
+from collections import Counter
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class Labeler:
-    """Clase para crear etiquetas de trading"""
+
+def load_config(config_path='config.yaml'):
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
+
+
+def create_labels(df, H=5, tau=0.005):
+    """
+    Calcula etiquetas basadas en rendimiento futuro.
     
-    def __init__(self, config):
-        self.config = config
-        self.horizon = config['horizon']
-        self.threshold = config['threshold']
-        
-    def calculate_future_returns(self, df):
-        """
-        Calcula retornos futuros a H días
-        
-        Args:
-            df: DataFrame con precios
-            
-        Returns:
-            Series con retornos futuros
-        """
-        future_prices = df['close'].shift(-self.horizon)
-        future_returns = (future_prices - df['close']) / df['close']
-        return future_returns
+    Args:
+        df: DataFrame con columna 'Close'
+        H: Horizonte (días hacia adelante)
+        tau: Umbral (ej: 0.005 = 0.5%)
     
-    def create_labels(self, returns):
-        """
-        Crea etiquetas multiclase basadas en umbral
-        
-        Args:
-            returns: Serie de retornos futuros
-            
-        Returns:
-            Series con etiquetas (0: hold, 1: long, 2: short)
-        """
-        labels = pd.Series(index=returns.index, dtype=int)
-        
-        # Long: retorno > +threshold
-        labels[returns > self.threshold] = 1
-        
-        # Short: retorno < -threshold
-        labels[returns < -self.threshold] = 2
-        
-        # Hold: resto
-        labels[(returns >= -self.threshold) & (returns <= self.threshold)] = 0
-        
-        return labels
+    Returns:
+        Series con etiquetas {0: long, 1: hold, 2: short}
+    """
+    # Rendimiento futuro de H días
+    future_return = df['Close'].shift(-H) / df['Close'] - 1
     
-    def calculate_class_weights(self, labels, splits):
-        """
-        Calcula pesos de clase para balancear el dataset
-        Solo usa datos de entrenamiento
-        
-        Args:
-            labels: Series con etiquetas
-            splits: Diccionario con índices de splits
-            
-        Returns:
-            Diccionario con pesos por clase
-        """
-        # Usar solo datos de train
-        train_start, train_end = splits['train_idx']
-        train_labels = labels.iloc[train_start:train_end]
-        
-        # Contar clases
-        class_counts = train_labels.value_counts()
-        total_samples = len(train_labels)
-        n_classes = len(class_counts)
-        
-        # Calcular pesos inversamente proporcionales a frecuencia
-        class_weights = {}
-        for class_id in class_counts.index:
-            class_weights[class_id] = total_samples / (n_classes * class_counts[class_id])
-        
-        logger.info(f"Distribución de clases en train:")
-        logger.info(f"  Hold (0):  {class_counts.get(0, 0)} samples ({class_counts.get(0, 0)/total_samples*100:.1f}%)")
-        logger.info(f"  Long (1):  {class_counts.get(1, 0)} samples ({class_counts.get(1, 0)/total_samples*100:.1f}%)")
-        logger.info(f"  Short (2): {class_counts.get(2, 0)} samples ({class_counts.get(2, 0)/total_samples*100:.1f}%)")
-        logger.info(f"Class weights: {class_weights}")
-        
-        return class_weights
+    # Clasificación
+    labels = pd.Series(index=df.index, dtype=int)
+    labels[future_return > tau] = 0   # Long
+    labels[future_return < -tau] = 2  # Short
+    labels[(future_return >= -tau) & (future_return <= tau)] = 1  # Hold
     
-    def process_labels(self):
-        """Pipeline principal de etiquetado"""
-        # Cargar datos con features
-        df = pd.read_parquet('data/processed/features.parquet')
-        
-        # Cargar splits
-        with open('data/processed/splits.pkl', 'rb') as f:
-            splits = pickle.load(f)
-        
-        logger.info(f"Creando etiquetas con horizon={self.horizon}, threshold={self.threshold}")
-        
-        # Calcular retornos futuros
-        future_returns = self.calculate_future_returns(df)
-        
-        # Crear etiquetas
-        labels = self.create_labels(future_returns)
-        
-        # Agregar a dataframe
-        df['future_return'] = future_returns
-        df['label'] = labels
-        
-        # Eliminar últimas H filas (no tienen etiqueta válida)
-        df = df[:-self.horizon].copy()
-        
-        # Calcular class weights
-        class_weights = self.calculate_class_weights(labels, splits)
-        
-        # Guardar datos etiquetados
-        df.to_parquet('data/processed/labeled_features.parquet', index=False)
-        
-        # Guardar class weights
-        with open('data/processed/class_weights.pkl', 'wb') as f:
-            pickle.dump(class_weights, f)
-        
-        logger.info(f"Etiquetas creadas y guardadas")
-        logger.info(f"Shape final: {df.shape}")
-        
-        return df, class_weights
+    return labels
+
+
+def analyze_class_distribution(labels):
+    """Analiza distribución de clases y calcula class weights."""
+    counts = Counter(labels.dropna())
+    total = sum(counts.values())
+    
+    logger.info("Distribución de clases:")
+    label_names = {0: 'long', 1: 'hold', 2: 'short'}
+    for label, count in sorted(counts.items()):
+        pct = (count / total) * 100
+        logger.info(f"  {label_names[label]} ({label}): {count} ({pct:.2f}%)")
+    
+    # Calcular class weights: inversamente proporcional a frecuencia
+    n_classes = len(counts)
+    class_weights = {}
+    for label in range(n_classes):
+        if label in counts:
+            class_weights[label] = total / (n_classes * counts[label])
+        else:
+            class_weights[label] = 1.0
+    
+    logger.info(f"Class weights calculados: {class_weights}")
+    
+    return class_weights
+
 
 def main():
-    """Ejecutar etiquetado"""
-    with open('config.yaml', 'r') as f:
-        config = yaml.safe_load(f)
+    """Flujo principal de generación de etiquetas."""
+    config = load_config()
     
-    labeler = Labeler(config)
-    labeler.process_labels()
+    # Cargar features
+    df = pd.read_parquet(config['data']['processed_path'])
+    logger.info(f"Features cargados: {len(df)} filas")
+    
+    # Parámetros de labeling
+    H = config['labeling']['H']
+    tau = config['labeling']['tau']
+    logger.info(f"Parámetros: H={H}, τ={tau} ({tau*100:.2f}%)")
+    
+    # Crear etiquetas
+    df['label'] = create_labels(df, H=H, tau=tau)
+    
+    # Analizar distribución
+    class_weights = analyze_class_distribution(df['label'])
+    
+    # Guardar class weights en archivo
+    weights_df = pd.DataFrame(class_weights.items(), columns=['class', 'weight'])
+    weights_df.to_csv('data/processed/class_weights.csv', index=False)
+    logger.info("Class weights guardados en data/processed/class_weights.csv")
+    
+    # Remover últimas H filas (no tienen etiqueta válida)
+    df = df.iloc[:-H]
+    logger.info(f"Filas después de remover últimas {H}: {len(df)}")
+    
+    # Guardar features + labels
+    df.to_parquet(config['data']['processed_path'])
+    logger.info(f"Features con labels guardados en {config['data']['processed_path']}")
+    
+    logger.info("✅ labeling.py completado exitosamente")
+
 
 if __name__ == "__main__":
     main()

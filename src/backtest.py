@@ -1,402 +1,348 @@
 # src/backtest.py
 """
-Backtest con costos realistas de trading
+Backtest realista con costos:
+- Comisión: 0.125% por lado (compra/venta)
+- Borrow cost: 0.25% anual en cortos (prorrateado por días)
+- Stop Loss y Take Profit
+
+Métricas: retorno total, Sharpe, Sortino, Calmar, Max Drawdown, Win-rate, etc.
 """
-import pandas as pd
+
 import numpy as np
+import pandas as pd
 import yaml
-import pickle
 import logging
 import matplotlib.pyplot as plt
-from datetime import datetime, timedelta
+from pathlib import Path
+import mlflow
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class Backtester:
-    """Backtesting con costos de transacción"""
+
+def load_config(config_path='config.yaml'):
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
+
+
+def load_signals_and_prices():
+    """
+    Carga señales generadas y precios correspondientes.
+    Asume que las señales están en results/signals_val.csv
+    y que corresponden al set de validación.
+    """
+    # Cargar señales
+    signals_df = pd.read_csv('results/signals_val.csv')
     
-    def __init__(self, config):
-        self.config = config
-        self.backtest_config = config['backtest']
-        self.initial_capital = self.backtest_config['initial_capital']
-        self.n_shares = self.backtest_config['n_shares']
-        self.stop_loss = self.backtest_config['stop_loss']
-        self.take_profit = self.backtest_config['take_profit']
-        self.commission = self.backtest_config['commission']
-        self.borrow_rate = self.backtest_config['borrow_rate']
-        
-    def calculate_commission(self, price, shares):
-        """Calcula comisión por transacción"""
-        return price * shares * self.commission
+    # Cargar precios del set de validación
+    # Necesitamos obtener las fechas correspondientes
+    df_full = pd.read_parquet('data/processed/features.parquet')
     
-    def calculate_borrow_cost(self, price, shares, days):
-        """Calcula costo de préstamo para posiciones cortas"""
-        annual_cost = price * shares * self.borrow_rate
-        daily_cost = annual_cost / 365
-        return daily_cost * days
+    # Cargar splits info para obtener índice de validación
+    splits_info = pd.read_csv('data/processed/splits_info.csv', index_col=0)
+    train_size = int(splits_info.loc['train', 'size'])
+    test_size = int(splits_info.loc['test', 'size'])
     
-    def execute_backtest(self, df, signals):
-        """
-        Ejecuta backtest con las señales generadas
+    # Ajustar por ventana W
+    W = load_config()['windows']['W']
+    
+    # El set de validación comienza en train_size + test_size
+    val_start_idx = train_size + test_size + W - 1
+    val_prices = df_full.iloc[val_start_idx:val_start_idx + len(signals_df)]
+    
+    logger.info(f"Precios de validación: {len(val_prices)} filas")
+    logger.info(f"Señales: {len(signals_df)} filas")
+    
+    return signals_df, val_prices
+
+
+def calculate_trade_returns(signals, prices, config):
+    """
+    Calcula retornos por trade considerando costos.
+    
+    Args:
+        signals: DataFrame con columna 'signal'
+        prices: DataFrame con columna 'Close'
+        config: configuración con parámetros de backtest
+    
+    Returns:
+        DataFrame con trades y métricas
+    """
+    commission = config['backtest']['commission']
+    borrow_rate_annual = config['backtest']['borrow_rate']
+    sl_pct = config['backtest']['stop_loss_pct']
+    tp_pct = config['backtest']['take_profit_pct']
+    
+    trades = []
+    equity = [1.0]  # Capital inicial = 1.0 (normalizado)
+    
+    current_position = None  # {type: 'long'/'short', entry_price, entry_idx}
+    
+    signals_array = signals['signal'].values
+    prices_array = prices['Close'].values
+    
+    for i in range(len(signals_array)):
+        signal = signals_array[i]
+        price = prices_array[i]
         
-        Args:
-            df: DataFrame con precios
-            signals: DataFrame con señales de trading
-            
-        Returns:
-            Diccionario con resultados y métricas
-        """
-        # Preparar datos
-        df = df.copy()
-        df['signal'] = 'hold'
+        # Si no hay posición, abrir según señal
+        if current_position is None:
+            if signal == 0:  # Long
+                current_position = {'type': 'long', 'entry_price': price, 'entry_idx': i}
+            elif signal == 2:  # Short
+                current_position = {'type': 'short', 'entry_price': price, 'entry_idx': i}
+            # Si es hold (1), no hacer nada
         
-        # Mapear señales a fechas
-        test_start_idx = len(df) - len(signals)
-        df.iloc[test_start_idx:, df.columns.get_loc('signal')] = signals['signal'].values
-        
-        # Variables de estado
-        cash = self.initial_capital
-        position = 0  # 1: long, -1: short, 0: neutral
-        shares = 0
-        entry_price = 0
-        entry_date = None
-        
-        # Tracking
-        trades = []
-        equity_curve = []
-        
-        for i in range(test_start_idx, len(df)):
-            row = df.iloc[i]
-            current_price = row['close']
-            current_signal = row['signal']
-            current_date = row['date']
+        else:
+            # Verificar SL/TP o cambio de señal
+            entry_price = current_position['entry_price']
+            position_type = current_position['type']
             
-            # Calcular equity actual
-            if position == 1:  # Long
-                current_equity = cash + (shares * current_price)
-            elif position == -1:  # Short
-                current_equity = cash - (shares * current_price)
-            else:
-                current_equity = cash
+            # Calcular retorno actual
+            if position_type == 'long':
+                raw_return = (price - entry_price) / entry_price
+            else:  # short
+                raw_return = (entry_price - price) / entry_price
             
-            equity_curve.append({
-                'date': current_date,
-                'equity': current_equity,
-                'cash': cash,
-                'position': position
-            })
+            # Verificar SL/TP
+            close_position = False
+            exit_reason = None
             
-            # Check stop loss / take profit
-            if position != 0 and entry_price > 0:
-                if position == 1:  # Long position
-                    pnl_pct = (current_price - entry_price) / entry_price
-                    
-                    if pnl_pct <= -self.stop_loss or pnl_pct >= self.take_profit:
-                        # Cerrar posición
-                        gross_pnl = shares * (current_price - entry_price)
-                        commission = self.calculate_commission(current_price, shares)
-                        net_pnl = gross_pnl - commission
-                        
-                        cash += shares * current_price - commission
-                        
-                        trades.append({
-                            'entry_date': entry_date,
-                            'exit_date': current_date,
-                            'type': 'long',
-                            'entry_price': entry_price,
-                            'exit_price': current_price,
-                            'shares': shares,
-                            'gross_pnl': gross_pnl,
-                            'commission': commission * 2,  # Entrada + salida
-                            'net_pnl': net_pnl,
-                            'return_pct': pnl_pct
-                        })
-                        
-                        position = 0
-                        shares = 0
-                        entry_price = 0
-                        entry_date = None
-                        
-                elif position == -1:  # Short position
-                    pnl_pct = (entry_price - current_price) / entry_price
-                    
-                    if pnl_pct <= -self.stop_loss or pnl_pct >= self.take_profit:
-                        # Cerrar posición
-                        gross_pnl = shares * (entry_price - current_price)
-                        
-                        # Calcular días en posición para borrow cost
-                        days_held = (current_date - entry_date).days
-                        borrow_cost = self.calculate_borrow_cost(
-                            entry_price, shares, days_held
-                        )
-                        commission = self.calculate_commission(current_price, shares)
-                        net_pnl = gross_pnl - commission - borrow_cost
-                        
-                        cash += shares * entry_price  # Devolver préstamo
-                        cash -= shares * current_price  # Comprar para cubrir
-                        cash -= commission
-                        cash -= borrow_cost
-                        
-                        trades.append({
-                            'entry_date': entry_date,
-                            'exit_date': current_date,
-                            'type': 'short',
-                            'entry_price': entry_price,
-                            'exit_price': current_price,
-                            'shares': shares,
-                            'gross_pnl': gross_pnl,
-                            'commission': commission * 2,
-                            'borrow_cost': borrow_cost,
-                            'net_pnl': net_pnl,
-                            'return_pct': pnl_pct
-                        })
-                        
-                        position = 0
-                        shares = 0
-                        entry_price = 0
-                        entry_date = None
+            if raw_return <= -sl_pct:
+                close_position = True
+                exit_reason = 'stop_loss'
+            elif raw_return >= tp_pct:
+                close_position = True
+                exit_reason = 'take_profit'
+            elif (position_type == 'long' and signal != 0) or \
+                 (position_type == 'short' and signal != 2):
+                close_position = True
+                exit_reason = 'signal_change'
             
-            # Procesar nuevas señales
-            if position == 0:  # Sin posición
-                if current_signal == 'long':
-                    # Abrir long
-                    shares = self.n_shares
-                    commission = self.calculate_commission(current_price, shares)
-                    
-                    if cash >= shares * current_price + commission:
-                        cash -= shares * current_price + commission
-                        position = 1
-                        entry_price = current_price
-                        entry_date = current_date
-                        
-                elif current_signal == 'short':
-                    # Abrir short
-                    shares = self.n_shares
-                    commission = self.calculate_commission(current_price, shares)
-                    
-                    cash += shares * current_price - commission  # Recibir préstamo
-                    position = -1
-                    entry_price = current_price
-                    entry_date = current_date
-        
-        # Cerrar posición final si existe
-        if position != 0:
-            final_price = df.iloc[-1]['close']
-            
-            if position == 1:
-                gross_pnl = shares * (final_price - entry_price)
-                commission = self.calculate_commission(final_price, shares)
-                net_pnl = gross_pnl - commission
-                cash += shares * final_price - commission
+            if close_position:
+                # Calcular retorno neto después de costos
+                days_held = i - current_position['entry_idx']
                 
-            else:  # Short
-                gross_pnl = shares * (entry_price - final_price)
-                days_held = (df.iloc[-1]['date'] - entry_date).days
-                borrow_cost = self.calculate_borrow_cost(entry_price, shares, days_held)
-                commission = self.calculate_commission(final_price, shares)
-                net_pnl = gross_pnl - commission - borrow_cost
+                # Comisión: 2 lados
+                cost_commission = 2 * commission
                 
-                cash += shares * entry_price
-                cash -= shares * final_price
-                cash -= commission
-                cash -= borrow_cost
-            
-            trades.append({
-                'entry_date': entry_date,
-                'exit_date': df.iloc[-1]['date'],
-                'type': 'long' if position == 1 else 'short',
-                'entry_price': entry_price,
-                'exit_price': final_price,
-                'shares': shares,
-                'gross_pnl': gross_pnl,
-                'commission': commission * 2,
-                'borrow_cost': borrow_cost if position == -1 else 0,
-                'net_pnl': net_pnl,
-                'return_pct': (final_price - entry_price) / entry_price if position == 1 
-                             else (entry_price - final_price) / entry_price
-            })
+                # Borrow cost (solo para shorts)
+                if position_type == 'short':
+                    cost_borrow = borrow_rate_annual * (days_held / 252)
+                else:
+                    cost_borrow = 0
+                
+                net_return = raw_return - cost_commission - cost_borrow
+                
+                # Actualizar equity
+                equity.append(equity[-1] * (1 + net_return))
+                
+                # Registrar trade
+                trades.append({
+                    'entry_idx': current_position['entry_idx'],
+                    'exit_idx': i,
+                    'type': position_type,
+                    'entry_price': entry_price,
+                    'exit_price': price,
+                    'raw_return': raw_return,
+                    'cost_commission': cost_commission,
+                    'cost_borrow': cost_borrow,
+                    'net_return': net_return,
+                    'days_held': days_held,
+                    'exit_reason': exit_reason
+                })
+                
+                # Cerrar posición
+                current_position = None
         
-        # Calcular métricas
-        metrics = self.calculate_metrics(trades, equity_curve)
-        
-        return {
-            'trades': trades,
-            'equity_curve': equity_curve,
-            'metrics': metrics
-        }
+        # Equity tracking (si no hay posición, mantener equity constante)
+        if current_position is None and len(equity) <= i:
+            equity.append(equity[-1])
     
-    def calculate_metrics(self, trades, equity_curve):
-        """Calcula métricas de performance"""
-        if len(trades) == 0:
-            return {
-                'total_trades': 0,
-                'win_rate': 0,
-                'total_return': 0,
-                'sharpe_ratio': 0,
-                'sortino_ratio': 0,
-                'calmar_ratio': 0,
-                'max_drawdown': 0
-            }
+    # Cerrar posición abierta al final si existe
+    if current_position is not None:
+        i = len(signals_array) - 1
+        price = prices_array[i]
+        entry_price = current_position['entry_price']
+        position_type = current_position['type']
         
-        # Convertir a DataFrame
-        trades_df = pd.DataFrame(trades)
-        equity_df = pd.DataFrame(equity_curve)
-        
-        # Métricas básicas
-        total_trades = len(trades_df)
-        winning_trades = len(trades_df[trades_df['net_pnl'] > 0])
-        win_rate = winning_trades / total_trades
-        
-        # Return total
-        initial_equity = self.initial_capital
-        final_equity = equity_df['equity'].iloc[-1]
-        total_return = (final_equity - initial_equity) / initial_equity
-        
-        # Returns diarios
-        equity_df['returns'] = equity_df['equity'].pct_change()
-        
-        # Sharpe Ratio (anualizado)
-        daily_returns = equity_df['returns'].dropna()
-        if len(daily_returns) > 0:
-            sharpe_ratio = (daily_returns.mean() / daily_returns.std()) * np.sqrt(252)
+        if position_type == 'long':
+            raw_return = (price - entry_price) / entry_price
         else:
-            sharpe_ratio = 0
+            raw_return = (entry_price - price) / entry_price
         
-        # Sortino Ratio (solo downside volatility)
-        downside_returns = daily_returns[daily_returns < 0]
-        if len(downside_returns) > 0:
-            sortino_ratio = (daily_returns.mean() / downside_returns.std()) * np.sqrt(252)
-        else:
-            sortino_ratio = 0
+        days_held = i - current_position['entry_idx']
+        cost_commission = 2 * commission
+        cost_borrow = borrow_rate_annual * (days_held / 252) if position_type == 'short' else 0
+        net_return = raw_return - cost_commission - cost_borrow
         
-        # Maximum Drawdown
-        equity_df['cummax'] = equity_df['equity'].cummax()
-        equity_df['drawdown'] = (equity_df['equity'] - equity_df['cummax']) / equity_df['cummax']
-        max_drawdown = equity_df['drawdown'].min()
+        equity.append(equity[-1] * (1 + net_return))
         
-        # Calmar Ratio
-        if max_drawdown != 0:
-            annualized_return = total_return * (252 / len(equity_df))
-            calmar_ratio = annualized_return / abs(max_drawdown)
-        else:
-            calmar_ratio = 0
-        
-        metrics = {
-            'total_trades': total_trades,
-            'winning_trades': winning_trades,
-            'losing_trades': total_trades - winning_trades,
-            'win_rate': win_rate,
-            'total_return': total_return,
-            'total_return_pct': total_return * 100,
-            'sharpe_ratio': sharpe_ratio,
-            'sortino_ratio': sortino_ratio,
-            'calmar_ratio': calmar_ratio,
-            'max_drawdown': max_drawdown,
-            'max_drawdown_pct': max_drawdown * 100,
-            'avg_trade_return': trades_df['return_pct'].mean() * 100,
-            'total_commission': trades_df['commission'].sum(),
-            'total_borrow_cost': trades_df['borrow_cost'].sum() if 'borrow_cost' in trades_df else 0
-        }
-        
-        return metrics
+        trades.append({
+            'entry_idx': current_position['entry_idx'],
+            'exit_idx': i,
+            'type': position_type,
+            'entry_price': entry_price,
+            'exit_price': price,
+            'raw_return': raw_return,
+            'cost_commission': cost_commission,
+            'cost_borrow': cost_borrow,
+            'net_return': net_return,
+            'days_held': days_held,
+            'exit_reason': 'end_of_period'
+        })
     
-    def plot_results(self, equity_curve, trades):
-        """Genera gráficos de resultados"""
-        equity_df = pd.DataFrame(equity_curve)
-        trades_df = pd.DataFrame(trades) if len(trades) > 0 else pd.DataFrame()
-        
-        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-        
-        # 1. Equity Curve
-        axes[0, 0].plot(equity_df['date'], equity_df['equity'], label='Portfolio Value')
-        axes[0, 0].axhline(y=self.initial_capital, color='r', linestyle='--', label='Initial Capital')
-        axes[0, 0].set_title('Equity Curve')
-        axes[0, 0].set_xlabel('Date')
-        axes[0, 0].set_ylabel('Portfolio Value ($)')
-        axes[0, 0].legend()
-        axes[0, 0].grid(True)
-        
-        # 2. Drawdown
-        equity_df['cummax'] = equity_df['equity'].cummax()
-        equity_df['drawdown'] = (equity_df['equity'] - equity_df['cummax']) / equity_df['cummax']
-        axes[0, 1].fill_between(equity_df['date'], equity_df['drawdown'] * 100, 0, color='red', alpha=0.3)
-        axes[0, 1].set_title('Drawdown')
-        axes[0, 1].set_xlabel('Date')
-        axes[0, 1].set_ylabel('Drawdown (%)')
-        axes[0, 1].grid(True)
-        
-        # 3. Distribution of Returns
-        if not trades_df.empty:
-            axes[1, 0].hist(trades_df['return_pct'] * 100, bins=30, edgecolor='black')
-            axes[1, 0].axvline(x=0, color='r', linestyle='--')
-            axes[1, 0].set_title('Distribution of Trade Returns')
-            axes[1, 0].set_xlabel('Return (%)')
-            axes[1, 0].set_ylabel('Frequency')
-            axes[1, 0].grid(True)
-        
-        # 4. Cumulative Trades
-        if not trades_df.empty:
-            trades_df['cumulative_pnl'] = trades_df['net_pnl'].cumsum()
-            axes[1, 1].plot(range(len(trades_df)), trades_df['cumulative_pnl'])
-            axes[1, 1].set_title('Cumulative P&L')
-            axes[1, 1].set_xlabel('Trade Number')
-            axes[1, 1].set_ylabel('Cumulative P&L ($)')
-            axes[1, 1].grid(True)
-        
+    trades_df = pd.DataFrame(trades)
+    equity_curve = np.array(equity[:len(signals_array)])
+    
+    return trades_df, equity_curve
+
+
+def calculate_metrics(trades_df, equity_curve):
+    """Calcula métricas de performance."""
+    if len(trades_df) == 0:
+        logger.warning("No se ejecutaron trades")
+        return {}
+    
+    # Retorno total
+    total_return = equity_curve[-1] - 1.0
+    
+    # Retornos diarios
+    daily_returns = np.diff(equity_curve) / equity_curve[:-1]
+    
+    # Sharpe ratio (anualizado, asumiendo 252 días de trading)
+    if np.std(daily_returns) > 0:
+        sharpe = (np.mean(daily_returns) / np.std(daily_returns)) * np.sqrt(252)
+    else:
+        sharpe = 0
+    
+    # Sortino ratio (solo desviación de retornos negativos)
+    negative_returns = daily_returns[daily_returns < 0]
+    if len(negative_returns) > 0 and np.std(negative_returns) > 0:
+        sortino = (np.mean(daily_returns) / np.std(negative_returns)) * np.sqrt(252)
+    else:
+        sortino = 0
+    
+    # Max Drawdown
+    cummax = np.maximum.accumulate(equity_curve)
+    drawdowns = (equity_curve - cummax) / cummax
+    max_drawdown = np.min(drawdowns)
+    
+    # Calmar ratio
+    if max_drawdown != 0:
+        calmar = (total_return / abs(max_drawdown))
+    else:
+        calmar = 0
+    
+    # Win rate
+    wins = (trades_df['net_return'] > 0).sum()
+    win_rate = wins / len(trades_df) if len(trades_df) > 0 else 0
+    
+    # Promedio de retornos por trade
+    avg_return_per_trade = trades_df['net_return'].mean()
+    
+    metrics = {
+        'total_return': total_return,
+        'sharpe_ratio': sharpe,
+        'sortino_ratio': sortino,
+        'calmar_ratio': calmar,
+        'max_drawdown': max_drawdown,
+        'win_rate': win_rate,
+        'n_trades': len(trades_df),
+        'avg_return_per_trade': avg_return_per_trade,
+        'total_commission_cost': trades_df['cost_commission'].sum(),
+        'total_borrow_cost': trades_df['cost_borrow'].sum()
+    }
+    
+    return metrics
+
+
+def plot_results(equity_curve, trades_df, save_dir='results'):
+    """Genera gráficos de resultados."""
+    Path(save_dir).mkdir(exist_ok=True)
+    
+    # Equity curve
+    plt.figure(figsize=(14, 6))
+    plt.plot(equity_curve, linewidth=2)
+    plt.xlabel('Días')
+    plt.ylabel('Equity (normalizado)')
+    plt.title('Equity Curve - Backtest')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f'{save_dir}/equity_curve.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    # Distribución de retornos por trade
+    if len(trades_df) > 0:
+        plt.figure(figsize=(10, 6))
+        plt.hist(trades_df['net_return'] * 100, bins=30, edgecolor='black', alpha=0.7)
+        plt.axvline(0, color='red', linestyle='--', linewidth=2)
+        plt.xlabel('Retorno neto por trade (%)')
+        plt.ylabel('Frecuencia')
+        plt.title('Distribución de Retornos por Trade')
+        plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        plt.savefig('backtest_results.png', dpi=100)
+        plt.savefig(f'{save_dir}/returns_distribution.png', dpi=150, bbox_inches='tight')
         plt.close()
-        
-        return 'backtest_results.png'
     
-    def run(self):
-        """Ejecuta backtest completo"""
-        # Cargar datos
-        df = pd.read_parquet('data/processed/labeled_features.parquet')
-        signals = pd.read_csv('data/processed/test_signals.csv')
-        
-        logger.info("Ejecutando backtest...")
-        
-        # Ejecutar backtest
-        results = self.execute_backtest(df, signals)
-        
-        # Generar gráficos
-        plot_path = self.plot_results(results['equity_curve'], results['trades'])
-        
-        # Log métricas
-        logger.info("\n=== Métricas de Backtest ===")
-        for key, value in results['metrics'].items():
-            if isinstance(value, float):
-                logger.info(f"{key}: {value:.4f}")
-            else:
-                logger.info(f"{key}: {value}")
-        
-        # Guardar resultados
-        import mlflow
-        with mlflow.start_run():
-            # Log métricas
-            for key, value in results['metrics'].items():
-                mlflow.log_metric(f"backtest_{key}", value)
-            
-            # Log gráficos
-            mlflow.log_artifact(plot_path)
-            
-            # Guardar trades
-            if len(results['trades']) > 0:
-                trades_df = pd.DataFrame(results['trades'])
-                trades_df.to_csv('backtest_trades.csv', index=False)
-                mlflow.log_artifact('backtest_trades.csv')
-        
-        return results
+    logger.info(f"Gráficos guardados en {save_dir}/")
+
 
 def main():
-    """Ejecutar backtest"""
-    with open('config.yaml', 'r') as f:
-        config = yaml.safe_load(f)
+    config = load_config()
     
-    backtester = Backtester(config)
-    backtester.run()
+    logger.info("Iniciando backtest...")
+    
+    # Cargar señales y precios
+    signals_df, prices_df = load_signals_and_prices()
+    
+    # Ejecutar backtest
+    trades_df, equity_curve = calculate_trade_returns(signals_df, prices_df, config)
+    
+    # Calcular métricas
+    metrics = calculate_metrics(trades_df, equity_curve)
+    
+    # Mostrar resultados
+    logger.info("\n" + "="*60)
+    logger.info("RESULTADOS DEL BACKTEST")
+    logger.info("="*60)
+    logger.info(f"Retorno Total:      {metrics['total_return']*100:.2f}%")
+    logger.info(f"Sharpe Ratio:       {metrics['sharpe_ratio']:.3f}")
+    logger.info(f"Sortino Ratio:      {metrics['sortino_ratio']:.3f}")
+    logger.info(f"Calmar Ratio:       {metrics['calmar_ratio']:.3f}")
+    logger.info(f"Max Drawdown:       {metrics['max_drawdown']*100:.2f}%")
+    logger.info(f"Win Rate:           {metrics['win_rate']*100:.2f}%")
+    logger.info(f"Número de Trades:   {metrics['n_trades']}")
+    logger.info(f"Retorno Prom/Trade: {metrics['avg_return_per_trade']*100:.2f}%")
+    logger.info(f"Costo Comisiones:   {metrics['total_commission_cost']*100:.2f}%")
+    logger.info(f"Costo Borrow:       {metrics['total_borrow_cost']*100:.2f}%")
+    logger.info("="*60 + "\n")
+    
+    # Guardar resultados
+    with open('results/backtest_report.txt', 'w') as f:
+        f.write("BACKTEST REPORT\n")
+        f.write("="*60 + "\n\n")
+        for k, v in metrics.items():
+            f.write(f"{k}: {v}\n")
+    
+    trades_df.to_csv('results/trades.csv', index=False)
+    np.save('results/equity_curve.npy', equity_curve)
+    
+    # Gráficos
+    plot_results(equity_curve, trades_df)
+    
+    # Loggear en MLflow (opcional, conectar a último run)
+    try:
+        mlflow.log_metrics(metrics)
+        mlflow.log_artifact('results/backtest_report.txt')
+        mlflow.log_artifact('results/equity_curve.png')
+        mlflow.log_artifact('results/returns_distribution.png')
+        logger.info("Resultados loggeados en MLflow")
+    except Exception as e:
+        logger.warning(f"No se pudo loggear en MLflow: {e}")
+    
+    logger.info("✅ Backtest completado")
+
 
 if __name__ == "__main__":
     main()

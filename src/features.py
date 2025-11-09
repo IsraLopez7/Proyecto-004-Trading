@@ -1,270 +1,247 @@
 # src/features.py
 """
-Feature Engineering: 20+ indicadores técnicos categorizados
+Calcula 20+ features técnicos sobre datos OHLCV:
+- Momentum: SMA, EMA, RSI, MACD, ROC, Stochastic, CCI
+- Volatilidad: ATR, Bollinger Bands (% b, bandwidth), volatilidad rolling
+- Volumen: OBV, MFI, z-score de volumen
+- Otros: ADX, lags de rendimientos
 """
+
 import pandas as pd
 import numpy as np
 import yaml
 import logging
-import pickle
 from pathlib import Path
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class FeatureEngineer:
-    """Clase para crear features técnicos"""
+
+def load_config(config_path='config.yaml'):
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
+
+
+def calculate_sma(df, windows):
+    """Simple Moving Average para múltiples ventanas."""
+    for w in windows:
+        df[f'SMA_{w}'] = df['Close'].rolling(window=w).mean()
+    return df
+
+
+def calculate_ema(df, windows):
+    """Exponential Moving Average."""
+    for w in windows:
+        df[f'EMA_{w}'] = df['Close'].ewm(span=w, adjust=False).mean()
+    return df
+
+
+def calculate_rsi(df, window=14):
+    """Relative Strength Index."""
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+    return df
+
+
+def calculate_macd(df, fast=12, slow=26, signal=9):
+    """MACD (Moving Average Convergence Divergence)."""
+    ema_fast = df['Close'].ewm(span=fast, adjust=False).mean()
+    ema_slow = df['Close'].ewm(span=slow, adjust=False).mean()
+    df['MACD'] = ema_fast - ema_slow
+    df['MACD_signal'] = df['MACD'].ewm(span=signal, adjust=False).mean()
+    df['MACD_hist'] = df['MACD'] - df['MACD_signal']
+    return df
+
+
+def calculate_atr(df, window=14):
+    """Average True Range (volatilidad)."""
+    high_low = df['High'] - df['Low']
+    high_close = np.abs(df['High'] - df['Close'].shift())
+    low_close = np.abs(df['Low'] - df['Close'].shift())
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    true_range = ranges.max(axis=1)
+    df['ATR'] = true_range.rolling(window=window).mean()
+    return df
+
+
+def calculate_bollinger_bands(df, window=20, num_std=2):
+    """Bollinger Bands: % b y bandwidth."""
+    sma = df['Close'].rolling(window=window).mean()
+    std = df['Close'].rolling(window=window).std()
+    df['BB_upper'] = sma + (std * num_std)
+    df['BB_lower'] = sma - (std * num_std)
+    df['BB_pct_b'] = (df['Close'] - df['BB_lower']) / (df['BB_upper'] - df['BB_lower'])
+    df['BB_bandwidth'] = (df['BB_upper'] - df['BB_lower']) / sma
+    return df
+
+
+def calculate_stochastic(df, window=14):
+    """Stochastic Oscillator."""
+    low_min = df['Low'].rolling(window=window).min()
+    high_max = df['High'].rolling(window=window).max()
+    df['Stoch_K'] = 100 * (df['Close'] - low_min) / (high_max - low_min)
+    df['Stoch_D'] = df['Stoch_K'].rolling(window=3).mean()
+    return df
+
+
+def calculate_adx(df, window=14):
+    """Average Directional Index (tendencia)."""
+    # Simplificado: ADX aproximado
+    high_diff = df['High'].diff()
+    low_diff = -df['Low'].diff()
     
-    def __init__(self, config):
-        self.config = config
-        
-    def add_momentum_features(self, df):
-        """
-        Features de momentum: RSI, ROC, Stochastic, etc.
-        """
-        # RSI (Relative Strength Index)
-        df['rsi_14'] = self.calculate_rsi(df['close'], 14)
-        df['rsi_30'] = self.calculate_rsi(df['close'], 30)
-        
-        # ROC (Rate of Change)
-        df['roc_10'] = df['close'].pct_change(10) * 100
-        df['roc_20'] = df['close'].pct_change(20) * 100
-        
-        # Stochastic Oscillator
-        df['stoch_k'] = self.calculate_stochastic(df, 14)
-        df['stoch_d'] = df['stoch_k'].rolling(3).mean()
-        
-        # MACD
-        exp1 = df['close'].ewm(span=12, adjust=False).mean()
-        exp2 = df['close'].ewm(span=26, adjust=False).mean()
-        df['macd'] = exp1 - exp2
-        df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
-        df['macd_hist'] = df['macd'] - df['macd_signal']
-        
-        # CCI (Commodity Channel Index)
-        df['cci'] = self.calculate_cci(df, 20)
-        
-        return df
+    pos_dm = high_diff.where((high_diff > low_diff) & (high_diff > 0), 0)
+    neg_dm = low_diff.where((low_diff > high_diff) & (low_diff > 0), 0)
     
-    def add_volatility_features(self, df):
-        """
-        Features de volatilidad: ATR, Bollinger, volatilidad rolling
-        """
-        # ATR (Average True Range)
-        df['atr_14'] = self.calculate_atr(df, 14)
-        
-        # Bollinger Bands
-        sma_20 = df['close'].rolling(20).mean()
-        std_20 = df['close'].rolling(20).std()
-        df['bb_upper'] = sma_20 + (2 * std_20)
-        df['bb_lower'] = sma_20 - (2 * std_20)
-        df['bb_pct'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
-        df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / sma_20
-        
-        # Volatilidad rolling
-        df['volatility_10'] = df['close'].pct_change().rolling(10).std()
-        df['volatility_30'] = df['close'].pct_change().rolling(30).std()
-        
-        # ADX (Average Directional Index)
-        df['adx'] = self.calculate_adx(df, 14)
-        
-        return df
+    atr = df['ATR'] if 'ATR' in df.columns else df['Close'].diff().abs().rolling(window).mean()
     
-    def add_volume_features(self, df):
-        """
-        Features de volumen: OBV, MFI, z-score volumen
-        """
-        # OBV (On Balance Volume)
-        df['obv'] = self.calculate_obv(df)
-        
-        # MFI (Money Flow Index)
-        df['mfi'] = self.calculate_mfi(df, 14)
-        
-        # Volume Z-score
-        df['volume_zscore'] = (df['volume'] - df['volume'].rolling(20).mean()) / df['volume'].rolling(20).std()
-        
-        # Volume MA ratio
-        df['volume_ma_ratio'] = df['volume'] / df['volume'].rolling(20).mean()
-        
-        return df
+    pos_di = 100 * (pos_dm.rolling(window).mean() / atr)
+    neg_di = 100 * (neg_dm.rolling(window).mean() / atr)
     
-    def add_price_features(self, df):
-        """
-        Features adicionales de precio: SMA, EMA, returns
-        """
-        # Moving Averages
-        for period in [5, 10, 20, 50]:
-            df[f'sma_{period}'] = df['close'].rolling(period).mean()
-            df[f'ema_{period}'] = df['close'].ewm(span=period, adjust=False).mean()
-            
-        # Price ratios
-        df['price_to_sma20'] = df['close'] / df['sma_20']
-        df['price_to_sma50'] = df['close'] / df['sma_50']
-        
-        # Returns
-        df['return_1d'] = df['close'].pct_change()
-        df['return_5d'] = df['close'].pct_change(5)
-        
-        return df
+    dx = 100 * np.abs(pos_di - neg_di) / (pos_di + neg_di)
+    df['ADX'] = dx.rolling(window).mean()
+    return df
+
+
+def calculate_cci(df, window=20):
+    """Commodity Channel Index."""
+    tp = (df['High'] + df['Low'] + df['Close']) / 3
+    sma_tp = tp.rolling(window=window).mean()
+    mad = tp.rolling(window=window).apply(lambda x: np.abs(x - x.mean()).mean())
+    df['CCI'] = (tp - sma_tp) / (0.015 * mad)
+    return df
+
+
+def calculate_roc(df, window=12):
+    """Rate of Change."""
+    df['ROC'] = ((df['Close'] - df['Close'].shift(window)) / df['Close'].shift(window)) * 100
+    return df
+
+
+def calculate_obv(df):
+    """On-Balance Volume."""
+    obv = [0]
+    for i in range(1, len(df)):
+        if df['Close'].iloc[i] > df['Close'].iloc[i-1]:
+            obv.append(obv[-1] + df['Volume'].iloc[i])
+        elif df['Close'].iloc[i] < df['Close'].iloc[i-1]:
+            obv.append(obv[-1] - df['Volume'].iloc[i])
+        else:
+            obv.append(obv[-1])
+    df['OBV'] = obv
+    return df
+
+
+def calculate_mfi(df, window=14):
+    """Money Flow Index (volumen + precio)."""
+    tp = (df['High'] + df['Low'] + df['Close']) / 3
+    mf = tp * df['Volume']
     
-    def calculate_rsi(self, prices, period=14):
-        """Calcula RSI"""
-        delta = prices.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs))
-        return rsi
+    positive_mf = mf.where(tp > tp.shift(), 0).rolling(window).sum()
+    negative_mf = mf.where(tp < tp.shift(), 0).rolling(window).sum()
     
-    def calculate_stochastic(self, df, period=14):
-        """Calcula Stochastic %K"""
-        low_min = df['low'].rolling(period).min()
-        high_max = df['high'].rolling(period).max()
-        stoch_k = 100 * ((df['close'] - low_min) / (high_max - low_min))
-        return stoch_k
+    mfi = 100 - (100 / (1 + positive_mf / negative_mf))
+    df['MFI'] = mfi
+    return df
+
+
+def calculate_returns_lags(df, lags=[1, 2, 5, 10]):
+    """Rendimientos pasados (lags)."""
+    returns = df['Close'].pct_change()
+    for lag in lags:
+        df[f'Return_lag_{lag}'] = returns.shift(lag)
+    return df
+
+
+def calculate_volatility_rolling(df, windows=[10, 20]):
+    """Volatilidad rolling (desviación estándar de rendimientos)."""
+    returns = df['Close'].pct_change()
+    for w in windows:
+        df[f'Volatility_{w}'] = returns.rolling(window=w).std()
+    return df
+
+
+def calculate_volume_zscore(df, window=20):
+    """Z-score del volumen (normalizado)."""
+    mean_vol = df['Volume'].rolling(window=window).mean()
+    std_vol = df['Volume'].rolling(window=window).std()
+    df['Volume_zscore'] = (df['Volume'] - mean_vol) / std_vol
+    return df
+
+
+def calculate_all_features(df, config):
+    """Calcula todas las features configuradas."""
+    logger.info("Calculando features técnicos...")
     
-    def calculate_atr(self, df, period=14):
-        """Calcula Average True Range"""
-        high_low = df['high'] - df['low']
-        high_close = np.abs(df['high'] - df['close'].shift())
-        low_close = np.abs(df['low'] - df['close'].shift())
-        ranges = pd.concat([high_low, high_close, low_close], axis=1)
-        true_range = ranges.max(axis=1)
-        atr = true_range.rolling(period).mean()
-        return atr
+    # Momentum
+    df = calculate_sma(df, config['features']['sma_windows'])
+    df = calculate_ema(df, config['features']['ema_windows'])
+    df = calculate_rsi(df, config['features']['rsi_window'])
+    df = calculate_macd(df, config['features']['macd_fast'], 
+                       config['features']['macd_slow'], 
+                       config['features']['macd_signal'])
+    df = calculate_roc(df, config['features']['roc_window'])
+    df = calculate_stochastic(df, config['features']['stoch_window'])
+    df = calculate_cci(df, config['features']['cci_window'])
     
-    def calculate_cci(self, df, period=20):
-        """Calcula Commodity Channel Index"""
-        typical_price = (df['high'] + df['low'] + df['close']) / 3
-        sma = typical_price.rolling(period).mean()
-        mad = typical_price.rolling(period).apply(lambda x: np.abs(x - x.mean()).mean())
-        cci = (typical_price - sma) / (0.015 * mad)
-        return cci
+    # Volatilidad
+    df = calculate_atr(df, config['features']['atr_window'])
+    df = calculate_bollinger_bands(df, config['features']['bollinger_window'], 
+                                   config['features']['bollinger_std'])
+    df = calculate_volatility_rolling(df, windows=[10, 20])
     
-    def calculate_adx(self, df, period=14):
-        """Calcula Average Directional Index (simplificado)"""
-        plus_dm = df['high'].diff()
-        minus_dm = -df['low'].diff()
-        plus_dm[plus_dm < 0] = 0
-        minus_dm[minus_dm < 0] = 0
-        
-        tr = self.calculate_atr(df, 1)  # True Range
-        plus_di = 100 * (plus_dm.rolling(period).mean() / tr.rolling(period).mean())
-        minus_di = 100 * (minus_dm.rolling(period).mean() / tr.rolling(period).mean())
-        
-        dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di)
-        adx = dx.rolling(period).mean()
-        return adx
+    # Volumen
+    if config['features']['obv']:
+        df = calculate_obv(df)
+    df = calculate_mfi(df, config['features']['mfi_window'])
+    df = calculate_volume_zscore(df)
     
-    def calculate_obv(self, df):
-        """Calcula On Balance Volume"""
-        obv = (np.sign(df['close'].diff()) * df['volume']).cumsum()
-        return obv
+    # Tendencia
+    df = calculate_adx(df, config['features']['adx_window'])
     
-    def calculate_mfi(self, df, period=14):
-        """Calcula Money Flow Index"""
-        typical_price = (df['high'] + df['low'] + df['close']) / 3
-        raw_money_flow = typical_price * df['volume']
-        
-        positive_flow = raw_money_flow.where(typical_price > typical_price.shift(), 0)
-        negative_flow = raw_money_flow.where(typical_price < typical_price.shift(), 0)
-        
-        positive_flow_sum = positive_flow.rolling(period).sum()
-        negative_flow_sum = negative_flow.rolling(period).sum()
-        
-        money_ratio = positive_flow_sum / negative_flow_sum
-        mfi = 100 - (100 / (1 + money_ratio))
-        return mfi
+    # Lags de rendimientos
+    df = calculate_returns_lags(df, lags=[1, 2, 5, 10])
     
-    def normalize_features(self, df, train_idx, test_idx, val_idx):
-        """
-        Normalización: fit en train, transform en test/val
-        """
-        feature_cols = [col for col in df.columns if col not in 
-                       ['date', 'open', 'high', 'low', 'close', 'volume', 'adj_close']]
-        
-        # Calcular estadísticas solo en train
-        train_start, train_end = train_idx
-        train_data = df.iloc[train_start:train_end]
-        
-        # Guardar estadísticas
-        stats = {}
-        for col in feature_cols:
-            stats[col] = {
-                'mean': train_data[col].mean(),
-                'std': train_data[col].std()
-            }
-        
-        # Aplicar normalización
-        for col in feature_cols:
-            if stats[col]['std'] > 0:
-                df[f'{col}_norm'] = (df[col] - stats[col]['mean']) / stats[col]['std']
-            else:
-                df[f'{col}_norm'] = 0
-        
-        # Guardar estadísticas para inferencia
-        with open('data/processed/normalization_stats.pkl', 'wb') as f:
-            pickle.dump(stats, f)
-        
-        return df
+    # Eliminar filas con NaN generados por ventanas
+    initial_rows = len(df)
+    df = df.dropna()
+    logger.info(f"Filas removidas por NaN en features: {initial_rows - len(df)}")
     
-    def create_features(self):
-        """Pipeline principal de creación de features"""
-        # Cargar datos
-        with open('config.yaml', 'r') as f:
-            config = yaml.safe_load(f)
-        
-        df = pd.read_csv(f"data/raw/{config['asset']}.csv")
-        df['date'] = pd.to_datetime(df['date'])
-        
-        # Cargar índices de splits
-        with open('data/processed/splits.pkl', 'rb') as f:
-            splits = pickle.load(f)
-        
-        logger.info("Creando features...")
-        
-        # Agregar todas las categorías de features
-        df = self.add_price_features(df)
-        df = self.add_momentum_features(df)
-        df = self.add_volatility_features(df)
-        df = self.add_volume_features(df)
-        
-        # Eliminar filas con NaN (debido a rolling windows)
-        df = df.dropna()
-        
-        # Normalizar features
-        df = self.normalize_features(
-            df,
-            splits['train_idx'],
-            splits['test_idx'],
-            splits['val_idx']
-        )
-        
-        # Seleccionar solo features normalizados para el modelo
-        feature_cols = [col for col in df.columns if col.endswith('_norm')]
-        
-        logger.info(f"Total de features creados: {len(feature_cols)}")
-        logger.info(f"Features: {feature_cols[:10]}...")  # Mostrar primeros 10
-        
-        # Guardar dataset con features
-        df.to_parquet('data/processed/features.parquet', index=False)
-        
-        # Guardar lista de features
-        with open('data/processed/feature_columns.pkl', 'wb') as f:
-            pickle.dump(feature_cols, f)
-        
-        logger.info(f"Features guardados en data/processed/features.parquet")
-        logger.info(f"Shape final: {df.shape}")
-        
-        return df
+    return df
+
 
 def main():
-    """Ejecutar feature engineering"""
-    with open('config.yaml', 'r') as f:
-        config = yaml.safe_load(f)
+    """Flujo principal de feature engineering."""
+    config = load_config()
     
-    engineer = FeatureEngineer(config)
-    engineer.create_features()
+    # Cargar datos limpios
+    df = pd.read_parquet('data/processed/clean_data.parquet')
+    logger.info(f"Datos cargados: {len(df)} filas")
+    
+    # Calcular features
+    df = calculate_all_features(df, config)
+    
+    # Contar features creados
+    original_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+    feature_cols = [col for col in df.columns if col not in original_cols]
+    logger.info(f"Total de features calculados: {len(feature_cols)}")
+    logger.info(f"Features: {feature_cols}")
+    
+    # Guardar
+    output_path = config['data']['processed_path']
+    df.to_parquet(output_path)
+    logger.info(f"Features guardados en {output_path}")
+    
+    # Guardar lista de features para referencia
+    with open('data/processed/feature_names.txt', 'w') as f:
+        for feat in feature_cols:
+            f.write(f"{feat}\n")
+    
+    logger.info("✅ features.py completado exitosamente")
+
 
 if __name__ == "__main__":
     main()

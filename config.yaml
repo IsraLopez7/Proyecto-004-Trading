@@ -1,39 +1,87 @@
 # config.yaml
-# Configuración general del proyecto
-asset: "QQQ"
-data_start: "2010-01-01"
-data_end: "2024-12-31"
+# Configuración por defecto del proyecto
 
-# Parámetros de ventanas y etiquetado
-window_size: 256  # Días de historia para cada predicción
-horizon: 5        # Días hacia adelante para predicción
-threshold: 0.005  # 0.5% umbral para long/short
+# Datos
+data:
+  ticker: "QQQ"
+  start_date: "2009-01-01"
+  end_date: "2024-12-31"
+  raw_path: "data/raw/QQQ_daily.csv"
+  processed_path: "data/processed/features.parquet"
 
-# Splits de datos (cronológico)
-train_split: 0.6
-test_split: 0.2
-val_split: 0.2
+# Splits (cronológicos, sin look-ahead)
+splits:
+  train: 0.60
+  test: 0.20
+  val: 0.20
 
-# Parámetros del modelo CNN
+# Feature engineering
+features:
+  sma_windows: [10, 20, 50, 200]
+  ema_windows: [12, 26]
+  rsi_window: 14
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  atr_window: 14
+  bollinger_window: 20
+  bollinger_std: 2
+  stoch_window: 14
+  adx_window: 14
+  cci_window: 20
+  roc_window: 12
+  obv: true
+  mfi_window: 14
+
+# Labeling (etiquetas)
+labeling:
+  H: 5              # Horizonte (días hacia adelante)
+  tau: 0.005        # Umbral (0.5% = 0.005)
+
+# Ventanas para CNN
+windows:
+  W: 256            # Tamaño de ventana (secuencia de días)
+
+# Modelo CNN
 model:
-  filters: 64
-  kernel_size: 3
+  filters: [64, 128, 64]
+  kernel_sizes: [5, 3, 3]
+  pool_sizes: [2, 2, 2]
+  dense_units: [128, 64]
   dropout: 0.3
-  learning_rate: 0.001
+
+# Entrenamiento
+training:
   batch_size: 256
   epochs: 50
-  patience: 10  # Early stopping
+  learning_rate: 0.001
+  validation_split: 0.0  # No usar porque ya tenemos val explícito
+  random_seed: 42
 
-# Parámetros de backtest
-backtest:
-  initial_capital: 100000
-  n_shares: 100
-  stop_loss: 0.02    # 2%
-  take_profit: 0.03  # 3%
-  commission: 0.00125  # 0.125% por lado
-  borrow_rate: 0.0025  # 0.25% anual
+# Callbacks
+callbacks:
+  early_stopping:
+    patience: 10
+    restore_best_weights: true
+  reduce_lr:
+    patience: 5
+    factor: 0.5
+    min_lr: 0.00001
 
 # MLflow
 mlflow:
-  experiment_name: "cnn_trading_signals"
+  experiment_name: "QQQ_CNN_Trading"
   model_name: "cnn_signal_model"
+
+# API
+api:
+  host: "0.0.0.0"
+  port: 8000
+
+# Backtest
+backtest:
+  commission: 0.00125    # 0.125% por lado
+  borrow_rate: 0.0025    # 0.25% anual para cortos
+  n_shares: 100          # Número de acciones por trade
+  stop_loss_pct: 0.02    # 2% stop loss
+  take_profit_pct: 0.03  # 3% take profit

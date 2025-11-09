@@ -1,165 +1,136 @@
 # src/windows.py
 """
-Creación de ventanas temporales para CNN
+Crea tensores 3D (samples, W, n_features) para entrenar la CNN.
+W = tamaño de ventana (ej: 256 días).
+Cada muestra es una "foto" de W días consecutivos.
 """
+
 import pandas as pd
 import numpy as np
 import yaml
-import pickle
 import logging
+from sklearn.preprocessing import StandardScaler
+import pickle
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class WindowGenerator:
-    """Generador de ventanas temporales para series de tiempo"""
+
+def load_config(config_path='config.yaml'):
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
+
+
+def create_windows(data, labels, W):
+    """
+    Crea ventanas deslizantes de tamaño W.
     
-    def __init__(self, config):
-        self.config = config
-        self.window_size = config['window_size']
-        
-    def create_windows(self, data, features, labels):
-        """
-        Crea ventanas deslizantes de tamaño W
-        
-        Args:
-            data: DataFrame completo
-            features: Lista de columnas de features
-            labels: Array de etiquetas
-            
-        Returns:
-            X: Array 3D (n_samples, window_size, n_features)
-            y: Array 1D de etiquetas
-            indices: Índices originales para tracking
-        """
-        X_list = []
-        y_list = []
-        indices = []
-        
-        # Convertir features a array
-        feature_data = data[features].values
-        
-        # Crear ventanas deslizantes
-        for i in range(self.window_size, len(data)):
-            # Ventana de features
-            window = feature_data[i-self.window_size:i]
-            
-            # Etiqueta correspondiente
-            label = labels[i]
-            
-            # Solo agregar si la etiqueta es válida
-            if not np.isnan(label):
-                X_list.append(window)
-                y_list.append(label)
-                indices.append(i)
-        
-        X = np.array(X_list)
-        y = np.array(y_list)
-        
-        logger.info(f"Ventanas creadas: X shape={X.shape}, y shape={y.shape}")
-        
-        return X, y, indices
+    Args:
+        data: array (n_samples, n_features)
+        labels: array (n_samples,)
+        W: tamaño de ventana
     
-    def split_windows(self, X, y, indices, splits):
-        """
-        Divide ventanas según splits predefinidos
-        
-        Args:
-            X: Array de features
-            y: Array de etiquetas
-            indices: Índices originales
-            splits: Diccionario con índices de splits
-            
-        Returns:
-            Diccionario con X_train, y_train, etc.
-        """
-        # Ajustar índices por el window_size
-        train_start, train_end = splits['train_idx']
-        test_start, test_end = splits['test_idx']
-        val_start, val_end = splits['val_idx']
-        
-        # Encontrar índices en el array de ventanas
-        train_mask = (indices >= train_start + self.window_size) & (indices < train_end)
-        test_mask = (indices >= test_start) & (indices < test_end)
-        val_mask = (indices >= val_start) & (indices < val_end)
-        
-        result = {
-            'X_train': X[train_mask],
-            'y_train': y[train_mask],
-            'X_test': X[test_mask],
-            'y_test': y[test_mask],
-            'X_val': X[val_mask],
-            'y_val': y[val_mask],
-            'train_indices': np.array(indices)[train_mask],
-            'test_indices': np.array(indices)[test_mask],
-            'val_indices': np.array(indices)[val_mask]
-        }
-        
-        logger.info(f"Splits de ventanas:")
-        logger.info(f"  Train: {result['X_train'].shape[0]} ventanas")
-        logger.info(f"  Test:  {result['X_test'].shape[0]} ventanas")
-        logger.info(f"  Val:   {result['X_val'].shape[0]} ventanas")
-        
-        return result
+    Returns:
+        X: (n_windows, W, n_features)
+        y: (n_windows,)
+    """
+    X, y = [], []
     
-    def process_windows(self):
-        """Pipeline principal de creación de ventanas"""
-        # Cargar datos etiquetados
-        df = pd.read_parquet('data/processed/labeled_features.parquet')
-        
-        # Cargar lista de features y splits
-        with open('data/processed/feature_columns.pkl', 'rb') as f:
-            feature_cols = pickle.load(f)
-        
-        with open('data/processed/splits.pkl', 'rb') as f:
-            splits = pickle.load(f)
-        
-        logger.info(f"Creando ventanas de tamaño {self.window_size}")
-        
-        # Crear ventanas
-        X, y, indices = self.create_windows(
-            df,
-            feature_cols,
-            df['label'].values
-        )
-        
-        # Dividir en train/test/val
-        data_splits = self.split_windows(X, y, indices, splits)
-        
-        # Guardar arrays procesados
-        np.save('data/processed/X_train.npy', data_splits['X_train'])
-        np.save('data/processed/y_train.npy', data_splits['y_train'])
-        np.save('data/processed/X_test.npy', data_splits['X_test'])
-        np.save('data/processed/y_test.npy', data_splits['y_test'])
-        np.save('data/processed/X_val.npy', data_splits['X_val'])
-        np.save('data/processed/y_val.npy', data_splits['y_val'])
-        
-        # Guardar metadatos
-        metadata = {
-            'window_size': self.window_size,
-            'n_features': X.shape[2],
-            'feature_columns': feature_cols,
-            'indices': {
-                'train': data_splits['train_indices'],
-                'test': data_splits['test_indices'],
-                'val': data_splits['val_indices']
-            }
-        }
-        
-        with open('data/processed/window_metadata.pkl', 'wb') as f:
-            pickle.dump(metadata, f)
-        
-        logger.info("Ventanas creadas y guardadas exitosamente")
-        
-        return data_splits
+    for i in range(len(data) - W + 1):
+        X.append(data[i:i+W])
+        y.append(labels[i+W-1])  # Etiqueta del último día de la ventana
+    
+    return np.array(X), np.array(y)
+
+
+def normalize_data(train_data, test_data, val_data):
+    """
+    Normaliza datos: fit en train, transform en test/val.
+    
+    Returns:
+        train_norm, test_norm, val_norm, scaler
+    """
+    scaler = StandardScaler()
+    
+    # Fit solo en train
+    train_norm = scaler.fit_transform(train_data)
+    
+    # Transform en test y val
+    test_norm = scaler.transform(test_data)
+    val_norm = scaler.transform(val_data)
+    
+    logger.info(f"Normalización: mean={scaler.mean_[:5]}, std={scaler.scale_[:5]}")
+    
+    return train_norm, test_norm, val_norm, scaler
+
 
 def main():
-    """Ejecutar generación de ventanas"""
-    with open('config.yaml', 'r') as f:
-        config = yaml.safe_load(f)
+    """Flujo principal de creación de ventanas."""
+    config = load_config()
     
-    generator = WindowGenerator(config)
-    generator.process_windows()
+    # Cargar features + labels
+    df = pd.read_parquet(config['data']['processed_path'])
+    logger.info(f"Datos cargados: {len(df)} filas, {len(df.columns)} columnas")
+    
+    # Separar features de labels
+    label_col = 'label'
+    feature_cols = [col for col in df.columns if col not in ['label', 'Open', 'High', 'Low', 'Close', 'Volume']]
+    
+    X = df[feature_cols].values
+    y = df[label_col].values
+    
+    logger.info(f"Features: {len(feature_cols)}")
+    logger.info(f"Shape inicial: X={X.shape}, y={y.shape}")
+    
+    # Cargar info de splits
+    splits_info = pd.read_csv('data/processed/splits_info.csv', index_col=0)
+    train_size = splits_info.loc['train', 'size']
+    test_size = splits_info.loc['test', 'size']
+    
+    # Dividir cronológicamente
+    X_train = X[:train_size]
+    y_train = y[:train_size]
+    
+    X_test = X[train_size:train_size+test_size]
+    y_test = y[train_size:train_size+test_size]
+    
+    X_val = X[train_size+test_size:]
+    y_val = y[train_size+test_size:]
+    
+    logger.info(f"Train: {X_train.shape}, Test: {X_test.shape}, Val: {X_val.shape}")
+    
+    # Normalizar (fit en train)
+    X_train_norm, X_test_norm, X_val_norm, scaler = normalize_data(X_train, X_test, X_val)
+    
+    # Guardar scaler para inferencia
+    with open('data/processed/scaler.pkl', 'wb') as f:
+        pickle.dump(scaler, f)
+    logger.info("Scaler guardado en data/processed/scaler.pkl")
+    
+    # Crear ventanas
+    W = config['windows']['W']
+    logger.info(f"Creando ventanas de tamaño W={W}")
+    
+    X_train_w, y_train_w = create_windows(X_train_norm, y_train, W)
+    X_test_w, y_test_w = create_windows(X_test_norm, y_test, W)
+    X_val_w, y_val_w = create_windows(X_val_norm, y_val, W)
+    
+    logger.info(f"Ventanas creadas:")
+    logger.info(f"  Train: {X_train_w.shape}, {y_train_w.shape}")
+    logger.info(f"  Test:  {X_test_w.shape}, {y_test_w.shape}")
+    logger.info(f"  Val:   {X_val_w.shape}, {y_val_w.shape}")
+    
+    # Guardar tensores
+    np.save('data/processed/X_train.npy', X_train_w)
+    np.save('data/processed/y_train.npy', y_train_w)
+    np.save('data/processed/X_test.npy', X_test_w)
+    np.save('data/processed/y_test.npy', y_test_w)
+    np.save('data/processed/X_val.npy', X_val_w)
+    np.save('data/processed/y_val.npy', y_val_w)
+    
+    logger.info("Tensores guardados en data/processed/")
+    logger.info("✅ windows.py completado exitosamente")
+
 
 if __name__ == "__main__":
     main()
