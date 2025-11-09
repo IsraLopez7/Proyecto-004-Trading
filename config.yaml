@@ -1,0 +1,39 @@
+# config.yaml
+# Configuración general del proyecto
+asset: "QQQ"
+data_start: "2010-01-01"
+data_end: "2024-12-31"
+
+# Parámetros de ventanas y etiquetado
+window_size: 256  # Días de historia para cada predicción
+horizon: 5        # Días hacia adelante para predicción
+threshold: 0.005  # 0.5% umbral para long/short
+
+# Splits de datos (cronológico)
+train_split: 0.6
+test_split: 0.2
+val_split: 0.2
+
+# Parámetros del modelo CNN
+model:
+  filters: 64
+  kernel_size: 3
+  dropout: 0.3
+  learning_rate: 0.001
+  batch_size: 256
+  epochs: 50
+  patience: 10  # Early stopping
+
+# Parámetros de backtest
+backtest:
+  initial_capital: 100000
+  n_shares: 100
+  stop_loss: 0.02    # 2%
+  take_profit: 0.03  # 3%
+  commission: 0.00125  # 0.125% por lado
+  borrow_rate: 0.0025  # 0.25% anual
+
+# MLflow
+mlflow:
+  experiment_name: "cnn_trading_signals"
+  model_name: "cnn_signal_model"
